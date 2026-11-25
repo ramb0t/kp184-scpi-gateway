@@ -8,6 +8,13 @@
 EXAMPLE   ?= DHCP
 TOOLCHAIN ?= $(HOME)/toolchains/wch-riscv-gcc12/bin/riscv-wch-elf-
 WLINK     ?= wlink
+# UART the examples' printf goes to: 1 = PA9, 2 = PA2, 3 = PB10. The board's TXD/RXD header is
+# USART2 (PA2/PA3), so that is the default, except for ETH_UART, which uses USART2 for its data.
+ifeq ($(EXAMPLE),ETH_UART)
+DEBUG_UART ?= 1
+else
+DEBUG_UART ?= 2
+endif
 
 SDK_URL := https://github.com/openwch/ch32v20x.git
 SDK_REV := b375bbbc7dfe8642d6fb7c17e6d3207ee1c3c9c1
@@ -35,14 +42,14 @@ vpath %.S $(sort $(dir $(S_SRCS)))
 ARCH    := -march=rv32imac_xw -mabi=ilp32 -msmall-data-limit=8 -msave-restore
 CFLAGS  := $(ARCH) -Os -g -std=gnu99 -fmessage-length=0 -fsigned-char \
            -ffunction-sections -fdata-sections -fno-common -Wunused \
-           -DCH32V20x_D8W \
+           -DCH32V20x_D8W -DDEBUG=$(DEBUG_UART) \
            -I$(APP)/User -I$(SRC)/Core -I$(SRC)/Debug -I$(SRC)/Peripheral/inc -I$(NET)
 LDFLAGS := $(ARCH) -T $(APP)/Ld/Link.ld -nostartfiles -Wl,--gc-sections \
            -Wl,-Map=$(OUT)/$(EXAMPLE).map -Wl,--print-memory-usage \
            --specs=nano.specs --specs=nosys.specs -L$(NET)
 LDLIBS  := -lwchnet
 
-.PHONY: all sdk flash clean
+.PHONY: all sdk flash clean FORCE
 all: $(OUT)/$(EXAMPLE).bin $(OUT)/$(EXAMPLE).hex
 	$(SIZE) $(OUT)/$(EXAMPLE).elf
 
@@ -55,11 +62,15 @@ $(OUT)/$(EXAMPLE).elf: $(OBJS) $(NET)/libwchnet.a $(APP)/Ld/Link.ld
 %.hex: %.elf
 	$(OBJCOPY) -O ihex $< $@
 
-$(OUT)/%.o: %.c | $(OUT)
+$(OUT)/%.o: %.c $(OUT)/.cflags
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(OUT)/%.o: %.S | $(OUT)
+$(OUT)/%.o: %.S $(OUT)/.cflags
 	$(CC) $(CFLAGS) -x assembler-with-cpp -MMD -MP -c $< -o $@
+
+# Rewritten only when the flags change, so a new DEBUG_UART rebuilds the objects.
+$(OUT)/.cflags: FORCE | $(OUT)
+	@echo '$(CFLAGS)' | cmp -s - $@ || echo '$(CFLAGS)' > $@
 
 $(OUT):
 	mkdir -p $@

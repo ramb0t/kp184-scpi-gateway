@@ -7,4 +7,6 @@ So far the board runs WCH's DHCP example built from this repo; the bridge firmwa
 
 `make sdk` fetches the pinned WCH SDK subset into `third_party/`, `make` builds the DHCP example, and `make flash` programs it over a WCH-Link with `wlink` and compares a readback. `EXAMPLE=ETH_UART` selects WCH's serial-to-Ethernet example instead.
 
+The board's TXD/RXD header is USART2 (PA2/PA3). The DHCP build prints its console there at 115200 baud; `DEBUG_UART=` moves it.
+
 The examples need WCH's GCC build, because they use `WCH-Interrupt-fast` and the `xw` extension. The Makefile expects it at `~/toolchains/wch-riscv-gcc12`; `TOOLCHAIN=` overrides that.
