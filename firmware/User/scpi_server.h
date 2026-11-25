@@ -8,9 +8,11 @@
 
 void Scpi_Init(void);
 void Scpi_Connect(uint8_t socketid);
-void Scpi_Disconnect(void);
+void Scpi_Disconnect(void);         /* the client has gone; its complete lines are still run */
+void Scpi_Close(void);              /* close the client's connection from this end */
+void Scpi_Check(void);              /* end the session if its slot went to another client */
 uint8_t Scpi_IsConnected(void);
 uint8_t Scpi_Socket(void);
-void Scpi_Poll(void);               /* call from the main loop: runs any complete command lines */
+void Scpi_Poll(void);               /* call from the main loop: runs the next received command lines */
 
 #endif

@@ -161,7 +161,7 @@ def main():
         expect(t, "MEAS:CURR?", "1.250")
         expect(t, "MEAS:POW?", "30.039")        # 24.031 V x 1.250 A
         expect(t, "MEAS:RES?", "19.225")        # 24.031 V / 1.250 A
-        expect_error(t, "FUNC RES", -365)       # this simulator stays silent when the mode is locked
+        expect_error(t, "FUNC RES", -221)       # the gateway refuses a mode change while the input is on
         t.write("*RST")
         expect(t, "INP?", "0")
         expect(t, "CURR 3;CURR?", "3.000")

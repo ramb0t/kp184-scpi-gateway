@@ -14,10 +14,12 @@
  * *RST switches the input off and changes nothing else.
  * Numbers are written as fixed-point text from the load's integer counts, so
  * nothing here depends on floating-point formatting. */
+#include <stdlib.h>
 #include <string.h>
 #include "scpi/scpi.h"
 #include "eth_driver.h"
 #include "scpi_server.h"
+#include "netsock.h"
 #include "kp184.h"
 #include "tick.h"
 
@@ -65,8 +67,15 @@ static char input_buffer[INPUT_BUFFER_LEN];
 static scpi_error_t error_queue[ERROR_QUEUE_LEN];
 static char output_buffer[OUTPUT_BUFFER_LEN];
 static uint16_t output_len;
-static uint8_t sock;
+static net_session_t sess;
+#define sock                (sess.id)
 static uint8_t connected;
+static uint8_t closing;             /* the client has closed: run what it sent, send nothing */
+static uint16_t line_len;           /* bytes of the current line handed to the parser */
+static uint8_t discarding;          /* dropping the rest of an overlong line */
+
+/* Longest line accepted, terminator included, with room to spare in the parser's buffer. */
+#define LINE_LIMIT          (INPUT_BUFFER_LEN - 8)
 
 /* --- output to the TCP connection ----------------------------------------- */
 
@@ -75,14 +84,23 @@ static void send_output(void)
     uint32_t done = 0, len;
     uint16_t t0 = Tick_Now();
 
-    while(connected && (done < output_len))
+    /* The connection is checked before every send: it may have closed, or
+     * its slot gone to a new client, during any WCHNET_MainTask(). */
+    while(connected && !closing && (done < output_len) && Net_SessionOpen(&sess))
     {
         len = output_len - done;
         if(WCHNET_SocketSend(sock, (uint8_t *)output_buffer + done, &len) == WCHNET_ERR_SUCCESS)
             done += len;
         if(done < output_len)
         {
-            if(Tick_Since(t0) > SEND_TIMEOUT) break;
+            if(Tick_Since(t0) > SEND_TIMEOUT)
+            {
+                /* A reply cut short would run into the next one and read as a
+                 * different number, so drop this client instead. */
+                WCHNET_SocketClose(sock, TCP_CLOSE_RST);
+                connected = 0;
+                break;
+            }
             WCHNET_MainTask();
         }
     }
@@ -139,6 +157,51 @@ static scpi_result_t bus_result(scpi_t *context, kp184_err_t r)
     return SCPI_RES_ERR;
 }
 
+/* The parser notices a surplus parameter only after the command has run, so
+ * "CURR 2,5" (a decimal comma) would set 2 A before the error. Commands that
+ * change the load call this first. */
+static scpi_bool_t params_done(scpi_t *context)
+{
+    lex_state_t *st = &context->param_list.lex_state;
+
+    if(st->pos < st->buffer + st->len)
+    {
+        SCPI_ErrorPush(context, SCPI_ERROR_PARAMETER_NOT_ALLOWED);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* IEEE 488.2 allows white space around the exponent mark, and the lexer takes
+ * "1 E-3" as one number, but the library's conversion stops at the space and
+ * reads 1. Detect that form in the next parameter so it can be refused rather
+ * than acted on with a value a thousand times too large. */
+static scpi_bool_t split_exponent(scpi_t *context)
+{
+    lex_state_t *st = &context->param_list.lex_state;
+    const char *p = st->pos;
+    int n = (int)(st->buffer + st->len - st->pos);
+    char text[40];
+    char *end;
+    int i;
+
+    while((n > 0) && ((*p == ' ') || (*p == '\t'))) { p++; n--; }
+    if(n <= 0) return FALSE;
+    if(n >= (int)sizeof(text)) n = sizeof(text) - 1;
+    memcpy(text, p, n);
+    text[n] = 0;
+    strtod(text, &end);
+    if(end == text) return FALSE;                   /* not a number: MIN, MAX, ON ... */
+    i = end - text;
+    while((text[i] == ' ') || (text[i] == '\t')) i++;
+    if((text[i] != 'E') && (text[i] != 'e')) return FALSE;     /* a suffix such as mA, or nothing */
+    i++;
+    while((text[i] == ' ') || (text[i] == '\t')) i++;
+    if((text[i] == '+') || (text[i] == '-')) i++;
+    while((text[i] == ' ') || (text[i] == '\t')) i++;
+    return (text[i] >= '0') && (text[i] <= '9');
+}
+
 /* Write value / 10^decimals as plain decimal text, e.g. 24031 with 3 -> 24.031. */
 static void result_fixed(scpi_t *context, uint64_t value, uint8_t decimals)
 {
@@ -175,19 +238,42 @@ static scpi_result_t cmd_tst_q(scpi_t *context)
 
 /* --- load commands ---------------------------------------------------------- */
 
+/* Measured on firmware 2128: the load acknowledges a switch to CV, reports
+ * CV for a few tens of milliseconds and then goes back to its old mode, so
+ * the mode is read back only after this. */
+#define MODE_SETTLE         TICK_MS(150)
+
 static scpi_result_t cmd_function(scpi_t *context)
 {
     int32_t mode;
     uint32_t now;
+    kp184_status_t st;
     kp184_err_t r;
+    uint16_t t0;
 
     if(!SCPI_ParamChoice(context, function_def, &mode, TRUE)) return SCPI_RES_ERR;
+    if(!params_done(context)) return SCPI_RES_ERR;
+    /* The manual says the mode cannot change while the input is on, but
+     * firmware 2128 switches at once, onto the other mode's setpoint. The
+     * gateway refuses instead, as the manual describes. */
+    r = KP184_Status(&st);
+    if(r != KP184_OK) return bus_result(context, r);
+    if(st.output_on)
+    {
+        SCPI_ErrorPush(context, SCPI_ERROR_SETTINGS_CONFLICT);
+        return SCPI_RES_ERR;
+    }
     r = KP184_Write(KP184_REG_MODE, (uint32_t)mode);
-    if(r == KP184_OK) r = KP184_Read(KP184_REG_MODE, &now);
+    if(r == KP184_OK)
+    {
+        t0 = Tick_Now();
+        while(Tick_Since(t0) < MODE_SETTLE) WCHNET_MainTask();
+        r = KP184_Read(KP184_REG_MODE, &now);
+    }
     if(r != KP184_OK) return bus_result(context, r);
     if(now != (uint32_t)mode)
     {
-        /* The load keeps its mode while the input is on. */
+        /* The load did not take it; it never takes CV over the bus. */
         SCPI_ErrorPush(context, SCPI_ERROR_SETTINGS_CONFLICT);
         return SCPI_RES_ERR;
     }
@@ -216,7 +302,13 @@ static scpi_result_t cmd_level(scpi_t *context)
     uint32_t counts;
     double scaled;
 
+    if(split_exponent(context))
+    {
+        SCPI_ErrorPush(context, SCPI_ERROR_NUMERIC_DATA_ERROR);
+        return SCPI_RES_ERR;
+    }
     if(!SCPI_ParamNumber(context, scpi_special_numbers_def, &n, TRUE)) return SCPI_RES_ERR;
+    if(!params_done(context)) return SCPI_RES_ERR;
     if(n.special)
     {
         if(n.content.tag == SCPI_NUM_MIN) counts = lv->min;
@@ -274,10 +366,36 @@ static scpi_result_t cmd_level_q(scpi_t *context)
 
 static scpi_result_t cmd_input(scpi_t *context)
 {
-    scpi_bool_t on;
+    scpi_parameter_t p;
+    int32_t choice;
+    double v;
+    uint8_t on;
 
-    if(!SCPI_ParamBool(context, &on, TRUE)) return SCPI_RES_ERR;
-    return bus_result(context, KP184_Write(KP184_REG_OUTPUT, on ? 1 : 0));
+    if(split_exponent(context))
+    {
+        SCPI_ErrorPush(context, SCPI_ERROR_NUMERIC_DATA_ERROR);
+        return SCPI_RES_ERR;
+    }
+    if(!SCPI_Parameter(context, &p, TRUE)) return SCPI_RES_ERR;
+    if(p.type == SCPI_TOKEN_PROGRAM_MNEMONIC)
+    {
+        if(!SCPI_ParamToChoice(context, &p, scpi_bool_def, &choice)) return SCPI_RES_ERR;
+        on = choice ? 1 : 0;
+    }
+    else if(p.type == SCPI_TOKEN_DECIMAL_NUMERIC_PROGRAM_DATA)
+    {
+        /* SCPI rounds a numeric boolean to an integer. The library truncates,
+         * which would switch the input on for "INP 1E-3". */
+        if(!SCPI_ParamToDouble(context, &p, &v)) return SCPI_RES_ERR;
+        on = ((v >= 0.5) || (v <= -0.5)) ? 1 : 0;
+    }
+    else
+    {
+        SCPI_ErrorPush(context, SCPI_ERROR_DATA_TYPE_ERROR);
+        return SCPI_RES_ERR;
+    }
+    if(!params_done(context)) return SCPI_RES_ERR;
+    return bus_result(context, KP184_Write(KP184_REG_OUTPUT, on));
 }
 
 static scpi_result_t cmd_input_q(scpi_t *context)
@@ -383,16 +501,45 @@ void Scpi_Init(void)
 
 void Scpi_Connect(uint8_t socketid)
 {
-    sock = socketid;
+    Net_SessionStart(&sess, socketid);
     output_len = 0;
     ctx.buffer.position = 0;        /* drop a half-typed line from the previous client */
+    line_len = 0;
+    discarding = 0;
+    closing = 0;
     SCPI_ErrorClear(&ctx);
     connected = 1;
 }
 
 void Scpi_Disconnect(void)
 {
+    /* Run the complete lines still waiting in the socket, such as a final
+     * INP OFF; their replies have nowhere to go. A line cut off by the end of
+     * the connection is not run. */
+    if(connected)
+    {
+        closing = 1;
+        while(connected && Net_SessionPending(&sess)) Scpi_Poll();
+    }
+    closing = 0;
     connected = 0;
+    sess.active = 0;
+}
+
+void Scpi_Close(void)
+{
+    if(!connected) return;
+    if(Net_SessionOpen(&sess)) WCHNET_SocketClose(sock, TCP_CLOSE_NORMAL);
+    Scpi_Disconnect();
+}
+
+void Scpi_Check(void)
+{
+    if(connected && !Net_SessionOwnsSlot(&sess))
+    {
+        connected = 0;
+        sess.active = 0;
+    }
 }
 
 uint8_t Scpi_IsConnected(void)
@@ -405,17 +552,65 @@ uint8_t Scpi_Socket(void)
     return sock;
 }
 
+/* Hand received bytes to the parser. A line too long for the parser's buffer
+ * is dropped whole, up to its newline: left to itself the parser would drop
+ * only what it holds and then run the rest of the line as a new command. */
+static void feed(const uint8_t *data, uint32_t len)
+{
+    uint32_t i, start = 0;
+
+    for(i = 0; i < len; i++)
+    {
+        if(discarding)
+        {
+            if(data[i] == '\n')
+            {
+                discarding = 0;
+                line_len = 0;
+            }
+            start = i + 1;
+            continue;
+        }
+        line_len++;
+        if(data[i] == '\n')
+        {
+            SCPI_Input(&ctx, (const char *)data + start, (int)(i + 1 - start));
+            start = i + 1;
+            line_len = 0;
+        }
+        else if(line_len >= LINE_LIMIT)
+        {
+            ctx.buffer.position = 0;
+            SCPI_ErrorPush(&ctx, SCPI_ERROR_INPUT_BUFFER_OVERRUN);
+            discarding = 1;
+            start = i + 1;
+        }
+    }
+    if(!discarding && (start < len))
+        SCPI_Input(&ctx, (const char *)data + start, (int)(len - start));
+}
+
+/* Reads one chunk per call, so the main loop polls socket events between
+ * chunks; a long command stream cannot starve the network. A connection
+ * found closed is drained of its complete lines and then ended; the main
+ * loop's event handler may already have done that. */
 void Scpi_Poll(void)
 {
     static uint8_t chunk[128];
     uint32_t len;
 
-    while(connected)
+    if(!connected) return;
+    if(!Net_SessionOwnsSlot(&sess))
     {
-        len = WCHNET_SocketRecvLen(sock, NULL);
-        if(len == 0) break;
-        if(len > sizeof(chunk)) len = sizeof(chunk);
-        if((WCHNET_SocketRecv(sock, chunk, &len) != WCHNET_ERR_SUCCESS) || (len == 0)) break;
-        SCPI_Input(&ctx, (const char *)chunk, (int)len);
+        Scpi_Check();
+        return;
+    }
+    len = Net_SessionRead(&sess, chunk, sizeof(chunk));
+    if(len) feed(chunk, len);
+    if(connected && !closing && !Net_SessionOpen(&sess) && !Net_SessionPending(&sess))
+    {
+        /* Closed and fully read. */
+        connected = 0;
+        sess.active = 0;
     }
 }

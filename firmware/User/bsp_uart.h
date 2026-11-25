@@ -54,6 +54,7 @@ extern uint8_t Uart_BusQuiet(void);             /* 1 once nothing has been recei
 
 /* Transmit side. Nothing is sent until the bus has been quiet for the guard time. */
 extern void Uart_TxKick(void);                  /* start the next queued DMA transfer, if any */
+extern uint8_t Uart_TxIdle(void);               /* nothing queued and the last stop bit has left */
 extern void Uart_SendBlocking(const uint8_t *buf, uint16_t len);  /* returns once the last bit has left */
 
 #endif /* end of bsp_uart.h */

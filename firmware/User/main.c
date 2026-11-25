@@ -23,6 +23,7 @@ While a raw client is connected it owns the RS485 port and SCPI commands that ne
 #include "bsp_uart.h"
 #include "kp184.h"
 #include "scpi_server.h"
+#include "netsock.h"
 #include "tick.h"
 
 #define SCPI_PORT      5025                                 //IANA "scpi-raw"
@@ -35,12 +36,9 @@ u8 GWIPAddr[4] = {0, 0, 0, 0};                              //Gateway IP address
 u8 IPMask[4]   = {0, 0, 0, 0};                              //subnet mask, filled in by DHCP
 
 u8 ListenValid = 0;                                         //1 once the listening sockets exist
-u8 RawSocket;                                               //socket id of the raw client
-u8 RawConnected = 0;                                        //0 disconnected  1 connect
+net_session_t Raw;                                          //the raw client, if Raw.active
 u8 RawRecvBuf[RECE_BUF_LEN];                                //receive buffer of the raw connection
 u8 ScpiRecvBuf[SCPI_RECV_BUF_LEN];                          //receive buffer of the SCPI connection
-
-u32 ethRxDropCnt = 0;                                   //frames dropped because no TX buffer was free
 /*********************************************************************
  * @fn      mStopIfError
  *
@@ -108,70 +106,65 @@ u8 WCHNET_CreateTcpSocketListen(u16 port)
 }
 
 /*********************************************************************
- * @fn      uartRxAndSendDataToETH
+ * @fn      RawEnd
  *
- * @brief   Raw port: send what the uart received to the client. Only the
- *          bytes actually handed to the stack are consumed, so a send that
- *          could not be queued is retried by the next call.
+ * @brief   The raw client is gone: give the RS485 port back to SCPI once
+ *          the load has finished answering it.
  *
  * @return  none
  */
-void uartRxAndSendDataToETH(void)
+void RawEnd(void)
+{
+    Raw.active = 0;
+    KP184_BusRelease();
+    printf("raw client gone\r\n");
+}
+
+/*********************************************************************
+ * @fn      RawPoll
+ *
+ * @brief   Raw port, called from the main loop. Bytes from the client go to
+ *          a uart TX buffer only when one is free, so a fast client is held
+ *          back by TCP flow control instead of losing data. Bytes from the
+ *          uart go to the client; only the bytes the stack accepted are
+ *          consumed, so a send that could not be queued is retried.
+ *
+ * @return  none
+ */
+void RawPoll(void)
 {
     u8 *p;
     uint32_t len;
 
-    len = Uart_RxPeek(&p);
-    if(len == 0) return;
-    if((WCHNET_SocketSend(RawSocket, p, &len) != WCHNET_ERR_SUCCESS) || (len == 0))
+    if(!Raw.active) return;
+    if(!Net_SessionOwnsSlot(&Raw))                  //the slot went to another client
     {
+        RawEnd();
         return;
     }
-    Uart_RxConsume(len);
-}
-
-/*********************************************************************
- * @fn      ETHRx
- *
- * @brief   Raw port: take data received from the client into a uart TX buffer.
- *
- * @param   socketid - socket id.
- *
- * @return  none
- */
-void ETHRx(u8 socketid)
-{
-    u32 len;
-    int8_t receive_state = -1;
-
-    len = WCHNET_SocketRecvLen(socketid, NULL);                               /* query length */
-    if(len > ETH_RECEIVE_SIZE)
-        len = ETH_RECEIVE_SIZE;
-
-    if( uart_data_t.tx_remainBuffNum > 0)
+    if(uart_data_t.tx_remainBuffNum > 0)
     {
-        /* socket receive */
-        receive_state = WCHNET_SocketRecv(socketid, uart_data_t.TX_buffer[uart_data_t.tx_write], &len);
-        if(receive_state == WCHNET_ERR_SUCCESS)
+        len = Net_SessionRead(&Raw, uart_data_t.TX_buffer[uart_data_t.tx_write], ETH_RECEIVE_SIZE);
+        if(len)
         {
             __disable_irq();
             uart_data_t.TX_data_length[uart_data_t.tx_write] = len;
-
-            uart_data_t.tx_write++;
-            /* Prevent access from out-of-bounds */
-            uart_data_t.tx_write = (uart_data_t.tx_write)%UART_TX_BUF_NUM;
-
+            uart_data_t.tx_write = (uart_data_t.tx_write + 1) % UART_TX_BUF_NUM;
             uart_data_t.tx_remainBuffNum--;
             __enable_irq();
         }
     }
-    else
-    {
-        WCHNET_SocketRecv(socketid, NULL, &len);
-        ethRxDropCnt++;
-        printf("eth receive buff busy, drop count: %u\r\n", (unsigned)ethRxDropCnt);
-    }
     Uart_TxKick();
+    if(!Net_SessionOpen(&Raw))
+    {
+        if(Net_SessionPending(&Raw) == 0) RawEnd();  //closed, and everything it sent is queued
+        return;
+    }
+    len = Uart_RxPeek(&p);
+    if(len && (WCHNET_SocketSend(Raw.id, p, &len) == WCHNET_ERR_SUCCESS) && len)
+    {
+        Uart_RxConsume(len);
+    }
 }
 
 /*********************************************************************
@@ -183,17 +176,12 @@ void ETHRx(u8 socketid)
  */
 void CloseClients(void)
 {
-    if(RawConnected)
+    if(Raw.active)
     {
-        RawConnected = 0;
-        KP184_BusLocked = 0;
-        WCHNET_SocketClose(RawSocket, TCP_CLOSE_NORMAL);
+        if(Net_SessionOpen(&Raw)) WCHNET_SocketClose(Raw.id, TCP_CLOSE_NORMAL);
+        RawEnd();
     }
-    if(Scpi_IsConnected())
-    {
-        Scpi_Disconnect();
-        WCHNET_SocketClose(Scpi_Socket(), TCP_CLOSE_NORMAL);
-    }
+    Scpi_Close();
 }
 
 /*********************************************************************
@@ -215,14 +203,18 @@ void WCHNET_HandleSockInt(u8 socketid,u8 intstat)
     {
         u16 port = SocketInf[socketid].SourPort;        //the local port tells which listener accepted it
 
-        if((port == RAW_PORT) && !RawConnected)
+        /* A session whose slot was just handed to this client is over, and
+         * the stack wiped its disconnect flag when it reused the slot. */
+        if(Raw.active && !Net_SessionOwnsSlot(&Raw)) RawEnd();
+        Scpi_Check();
+
+        if((port == RAW_PORT) && !Raw.active)
         {
-            RawSocket = socketid;
+            Net_SessionStart(&Raw, socketid);
             WCHNET_SocketSetKeepLive(socketid, ENABLE);
             WCHNET_ModifyRecvBuf(socketid, (u32)RawRecvBuf, RECE_BUF_LEN);
             Uart_RxFlush();                             //forget bytes that arrived while nobody was connected
             KP184_BusLocked = 1;
-            RawConnected = 1;
             printf("raw client connected\r\n");
         }
         else if((port == SCPI_PORT) && !Scpi_IsConnected())
@@ -241,26 +233,24 @@ void WCHNET_HandleSockInt(u8 socketid,u8 intstat)
     }
     if(intstat & SINT_STAT_RECV)                        //receive data
     {
-        if(RawConnected && (socketid == RawSocket))
-        {
-            ETHRx(socketid);
-        }
-        else if(!(Scpi_IsConnected() && (socketid == Scpi_Socket())))
+        /* The two clients' data is read by RawPoll() and Scpi_Poll(). Anything
+         * else is dropped, but only from a socket that is still open. */
+        if(!(Raw.active && (socketid == Raw.id)) && !(Scpi_IsConnected() && (socketid == Scpi_Socket())) &&
+           (SocketInf[socketid].SockStatus == SOCK_STAT_OPEN))
         {
             len = WCHNET_SocketRecvLen(socketid, NULL);
-            WCHNET_SocketRecv(socketid, NULL, &len);    //nobody wants it
+            if(len) WCHNET_SocketRecv(socketid, NULL, &len);
         }
-        /* SCPI data stays in the socket buffer until Scpi_Poll() reads it. */
     }
     if(intstat & (SINT_STAT_DISCONNECT | SINT_STAT_TIM_OUT))    //closed or timed out; the listening sockets stay open
     {
-        if(RawConnected && (socketid == RawSocket))
+        /* Checked separately: after a slot was reused, both could name it. */
+        if(Raw.active && (socketid == Raw.id))
         {
-            RawConnected = 0;
-            KP184_BusLocked = 0;
-            printf("raw client gone\r\n");
+            RawPoll();                                  //queue what the client sent before it closed
+            if(Raw.active) RawEnd();
         }
-        else if(Scpi_IsConnected() && (socketid == Scpi_Socket()))
+        if(Scpi_IsConnected() && (socketid == Scpi_Socket()))
         {
             Scpi_Disconnect();
             printf("SCPI client gone\r\n");
@@ -412,10 +402,8 @@ int main(void)
         {
             WCHNET_HandleGlobalInt();
         }
+        RawPoll();
         Uart_TxKick();
-        if(RawConnected){
-            uartRxAndSendDataToETH();
-        }
         Scpi_Poll();
     }
 }

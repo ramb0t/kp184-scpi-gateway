@@ -11,6 +11,7 @@
 *******************************************************************************/
 #include "bsp_uart.h"
 #include "tick.h"
+#include "eth_driver.h"
 
 /* Global Variable */
 
@@ -240,6 +241,25 @@ void Uart_TxKick(void)
     }
 }
 
+uint8_t Uart_TxIdle(void)
+{
+    return (uart_data_t.uart_tx_dma_state == IDLE) && (uart_data_t.tx_remainBuffNum == UART_TX_BUF_NUM) &&
+           (USART_GetFlagStatus(USART2, USART_FLAG_TC) != RESET);
+}
+
+/* Abandon whatever the raw port still has queued. */
+static void tx_abort(void)
+{
+    DMA_Cmd(DMA1_Channel7, DISABLE);
+    __disable_irq();
+    uart_data_t.tx_read = 0;
+    uart_data_t.tx_write = 0;
+    uart_data_t.tx_remainBuffNum = UART_TX_BUF_NUM;
+    uart_data_t.uart_tx_dma_state = IDLE;
+    __enable_irq();
+    while(USART_GetFlagStatus(USART2, USART_FLAG_TC) == RESET);
+}
+
 /**********************************************************************
  *  @fn      Uart_SendBlocking
  *
@@ -251,16 +271,23 @@ void Uart_SendBlocking(const uint8_t *buf, uint16_t len)
 {
     uint16_t t0 = Tick_Now();
 
-    /* Three full buffers take 1.5 s at 57600 baud; give up waiting after 3 s. */
+    /* Three full buffers take 1.5 s at 57600 baud. After 3 s, drop what is
+     * left rather than write into USART2 alongside the DMA. */
     while((uart_data_t.uart_tx_dma_state != IDLE) || (uart_data_t.tx_remainBuffNum < UART_TX_BUF_NUM))
     {
         Uart_TxKick();
-        if(Tick_Since(t0) > TICK_MS(3000)) break;
+        WCHNET_MainTask();
+        if(Tick_Since(t0) > TICK_MS(3000))
+        {
+            tx_abort();
+            break;
+        }
     }
     /* A bus that never falls silent must not hang the gateway: send anyway after 100 ms. */
     t0 = Tick_Now();
     while(!Uart_BusQuiet())
     {
+        WCHNET_MainTask();
         if(Tick_Since(t0) > TICK_MS(100)) break;
     }
     while(len--)
