@@ -1,0 +1,16 @@
+# Build output
+build/
+obj/
+Debug/
+Release/
+*.elf
+*.hex
+*.map
+*.lst
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
