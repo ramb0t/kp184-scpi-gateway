@@ -6,10 +6,15 @@ the WCH-Link's serial port wired to the board's TXD/RXD header.
 
 Frame formats and quirks follow replies captured from a real KP184 (firmware
 2128, 57600 8N1, address 1) on 2026-11-25; `--selftest` replays that capture.
-Write acknowledgements were not captured; the 8-byte form used here is what the
-validated korjaa/kunkin-kp184 library expects.
+The write acknowledgement in it was captured later the same day.
 
-Usage: kp184_sim.py PORT [--baud 57600] [--echo] [--drop N] [--corrupt N] [--locked-mode ack] [--verbose]
+Two things the real load does are not modelled yet. It never stays in CV when
+asked over the bus: it acknowledges, reports CV for about 50 ms and goes back.
+And it changes mode with the input on, at once; neither --locked-mode choice
+does that.
+
+Usage: kp184_sim.py PORT [--baud 57600] [--source-mv 24031] [--delay-ms 5.5] [--echo] [--drop N]
+                    [--corrupt N] [--locked-mode ack] [--verbose]
        kp184_sim.py --selftest
 """
 import argparse
@@ -40,7 +45,7 @@ class Load:
 
     def __init__(self, address=1, source_mv=24031, locked_mode="silent"):
         self.address = address
-        self.locked_mode = locked_mode  # reply to a mode change while the input is on: "silent" or "ack"
+        self.locked_mode = locked_mode  # a mode change while the input is on: "silent", or "ack" without obeying
         self.source_mv = source_mv      # open-circuit voltage of the supply under test
         self.output = 0
         self.mode = 1                   # CC
@@ -111,8 +116,9 @@ class Load:
             if reg == REG_OUTPUT:
                 self.output = value & 1
             elif reg == REG_MODE:
-                # The manual says the mode cannot change while loading. How the real
-                # load answers such a request is not known, so both guesses are offered.
+                # The manual says the mode cannot change while loading, and these two
+                # choices were guesses at how the load would say so. The real load
+                # (firmware 2128) acknowledges and switches; see the note at the top.
                 if value > 3 or (self.output and self.locked_mode == "silent"):
                     return None
                 if not self.output:
@@ -146,6 +152,7 @@ CAPTURE = """
 01 03 03 01 00 00 14 4e | 01 03 1f 02 04 00 5d df 00 00 00 00 03 e8 00 0a 00 0a 00 00 00 01 00 00 00 0b b8 00 00 1b 35 00 02 9b 4d ec f1
 01 03 01 0e 00 04 24 36 | 01 03 04 02 04 00 00 ba 4a
 01 03 01 10 00 04 44 30 | 01 03 04 02 04 00 01 7b 8a
+01 06 01 16 00 01 04 00 00 00 64 9f 4b | 01 06 01 16 00 64 68 19
 """
 
 
@@ -189,7 +196,7 @@ def main() -> int:
     ap.add_argument("--corrupt", type=int, default=0, metavar="N", help="break the CRC of every Nth reply")
     ap.add_argument("--delay-ms", type=float, default=5.5, help="reply delay, as measured on the real load")
     ap.add_argument("--locked-mode", choices=["silent", "ack"], default="silent",
-                    help="how a mode change is answered while the input is on (unknown on the real load)")
+                    help="how a mode change is answered while the input is on (the real load obeys it)")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()

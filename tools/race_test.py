@@ -13,51 +13,29 @@ import socket
 import sys
 import time
 
-SCPI, RAW = 5025, 4001
+from gateway import RAW_PORT, Checks, Scpi
+
 MODEL_READ = bytes.fromhex("01 03 00 01 00 04 15 c9")     # the load answers 1840, which would read as 1.840
-results = []
+check = Checks()
 
 
-def check(name, ok, detail=""):
-    results.append(ok)
-    print(f"  {'ok  ' if ok else 'FAIL'} {name}{'' if ok else '   ' + str(detail)}", flush=True)
-    return ok
-
-
-def connect(host, port):
-    s = socket.create_connection((host, port), timeout=5)
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    s.settimeout(3)
-    return s
-
-
-def query(s, cmd):
-    s.sendall(cmd.encode() + b"\n")
-    buf = b""
-    try:
-        while not buf.endswith(b"\n"):
-            d = s.recv(256)
-            if not d:
-                return None
-            buf += d
-    except (socket.timeout, ConnectionError):
-        return None
-    return buf.decode().strip()
+def connect(host, pause=0.2):
+    """A new SCPI client, retrying for a few seconds while the gateway is still busy with the last one."""
+    for _ in range(30):
+        try:
+            return Scpi(host, timeout=3)
+        except OSError:
+            time.sleep(pause)
+    return None
 
 
 def scpi(host, *cmds):
-    """Run commands on a fresh connection, retrying the connect for a few seconds."""
-    for _ in range(30):
-        try:
-            s = connect(host, SCPI)
-            break
-        except OSError:
-            time.sleep(0.2)
-    else:
+    """Run commands on a fresh connection; returns the replies, None for a command without one."""
+    s = connect(host)
+    if not s:
         return None
-    out = [query(s, c) if "?" in c else s.sendall(c.encode() + b"\n") for c in cmds]
-    s.close()
-    time.sleep(0.05)
+    out = [s.query(c) if "?" in c else s.write(c) for c in cmds]
+    s.close(settle=0.05)
     return out
 
 
@@ -69,16 +47,26 @@ def main():
         raise SystemExit(f"load not answering or input on: {first}")
     original = first[2]
     print(f"CC setpoint before: {original} A, input off, current {first[3]} A")
+    try:
+        races(host, rounds)
+    finally:
+        print("Restore and check")
+        end = scpi(host, f"CURR {original}", "CURR?", "INP?", "SYST:ERR?")
+        check(f"CC setpoint restored, input off, no errors ({end})",
+              end and end[1] == original and end[2] == "0" and (end[3] or "").startswith("0,"))
+    return check.summary()
 
+
+def races(host, rounds):
     print(f"A command sent just before closing, behind one still running ({rounds} rounds)")
     bad = []
     for i in range(rounds):
         want = f"{0.2 + i / 1000:.3f}"
-        s = connect(host, SCPI)
-        s.sendall(b"MEAS:VOLT?\n")
+        s = Scpi(host)
+        s.write("MEAS:VOLT?")
         time.sleep(0.005)                       # the voltage read is on the bus now
-        s.sendall(f"CURR {want}\n".encode())
-        s.close()
+        s.write(f"CURR {want}")
+        s.close(settle=0)
         got = scpi(host, "CURR?")
         if not got or got[0] != want:
             bad.append((want, got))
@@ -87,41 +75,28 @@ def main():
     print(f"A client leaves without its reply and is replaced at once ({rounds} rounds)")
     bad = []
     for i in range(rounds):
-        a = connect(host, SCPI)
-        a.sendall(b"MEAS:VOLT?\n")              # about 24 V
-        a.close()
-        b = None
-        for _ in range(30):
-            try:
-                b = connect(host, SCPI)
-                break
-            except OSError:
-                time.sleep(0.05)
-        got = query(b, "MEAS:CURR?") if b else None     # 0.000 with the input off
+        a = Scpi(host)
+        a.write("MEAS:VOLT?")                   # about 24 V
+        a.close(settle=0)
+        b = connect(host, pause=0.05)
+        got = b.query("MEAS:CURR?") if b else None      # 0.000 with the input off
         if b:
-            b.close()
+            b.close(settle=0.05)
         if got != "0.000":
             bad.append(got)
-        time.sleep(0.05)
     check("the new client never got the old client's reply", not bad, bad[:5])
 
     print(f"Raw client hands over to SCPI before the load has answered it ({rounds} rounds)")
-    now = scpi(host, "CURR?")[0]                # the first section changed it
+    now = (scpi(host, "CURR?") or [None])[0]    # the first section changed it
     bad = []
     for i in range(rounds):
-        r = connect(host, RAW)
+        r = socket.create_connection((host, RAW_PORT), timeout=5)
         r.sendall(MODEL_READ)
         r.close()
         got = scpi(host, "CURR?")
         if not got or got[0] != now:
             bad.append(got)
     check(f"SCPI read {now} A every time, never the raw reply (1.840)", not bad, bad[:5])
-
-    print("Restore and check")
-    end = scpi(host, f"CURR {original}", "CURR?", "INP?", "SYST:ERR?")
-    check(f"CC setpoint restored ({end})", end and end[1] == original and end[2] == "0")
-    print(f"\n{sum(results)} of {len(results)} checks passed")
-    return 0 if all(results) else 1
 
 
 if __name__ == "__main__":

@@ -7,8 +7,16 @@ Starts tools/kp184_sim.py on SERIAL_PORT, which must be wired to the board's
 TXD/RXD header in place of the load, then drives the SCPI port (5025) and the
 raw port (4001) of the gateway at HOST.
 
-Do not run this with a real load on the board: it switches the input on.
-It refuses to start if something already answers on the RS485 side.
+Do not run this with a real load on the board: it switches the input on at
+several amps. Two interlocks stand in the way, neither a substitute for
+checking the wiring: a read of the RS485 side must time out before the
+simulator starts, and must then return a voltage only the simulator would
+report. The first alone is not enough: a gateway that can send to a real load
+but not hear it passes it.
+
+Not run since the firmware gained the fail-safe, input off at boot and the
+refusal of FUNC VOLT; none of those is covered here, and the simulator still
+accepts CV, which the real load does not.
 """
 import os
 import socket
@@ -16,14 +24,12 @@ import subprocess
 import sys
 import time
 
+from gateway import RAW_PORT, SCPI_PORT, Checks, Scpi, raw_exchange
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCPI_PORT, RAW_PORT = 5025, 4001
-results = []
-
-
-def check(name, ok, detail=""):
-    results.append(ok)
-    print(f"  {'ok  ' if ok else 'FAIL'} {name}{'' if ok else '   ' + str(detail)}")
+MODEL_READ = bytes.fromhex("01 03 00 01 00 04 15 c9")
+MODEL_REPLY = bytes.fromhex("01 03 04 00 00 07 30 f8 17")
+check = Checks()
 
 
 class Sim:
@@ -44,43 +50,6 @@ class Sim:
             self.proc.wait()
             self.proc = None
             time.sleep(0.2)
-
-
-class Scpi:
-    def __init__(self, host):
-        self.s = socket.create_connection((host, SCPI_PORT), timeout=5)
-        self.s.settimeout(2.0)
-
-    def write(self, cmd, end="\n"):
-        self.s.sendall((cmd + end).encode())
-
-    def query(self, cmd, end="\n"):
-        """Reply without its newline, or None when nothing came back."""
-        self.write(cmd, end)
-        buf = b""
-        try:
-            while not buf.endswith(b"\n"):
-                d = self.s.recv(256)
-                if not d:
-                    return None
-                buf += d
-        except (socket.timeout, ConnectionError):
-            return None
-        return buf.decode().rstrip("\n")
-
-    def errors(self):
-        """Drain the error queue; returns the list of error numbers."""
-        out = []
-        for _ in range(12):
-            r = self.query("SYST:ERR?")
-            if r is None or r.startswith("0,"):
-                break
-            out.append(int(r.split(",")[0]))
-        return out
-
-    def close(self):
-        self.s.close()
-        time.sleep(0.3)
 
 
 def expect(scpi, cmd, want):
@@ -138,14 +107,28 @@ def main():
     host, port = sys.argv[1], sys.argv[2]
     sim = Sim(port)
 
-    # With the simulator not yet running, nothing may answer on the RS485 side.
+    # With the simulator not yet running, a read of the RS485 side must time out
+    # (-365). An answer means a load is connected; error 100 means a raw client
+    # holds the bus and nothing can be told.
     t = Scpi(host)
-    alone = t.query("*TST?")
+    reading = t.query("MEAS:VOLT?")
+    alone = t.errors()
     t.close()
-    if alone != "1":
-        raise SystemExit(f"*TST? returned {alone!r} before the simulator started: a load seems to be "
-                         "connected to the board. Refusing to run, this test switches the input on.")
+    if reading is not None or alone != [-365]:
+        raise SystemExit(f"Before the simulator started, MEAS:VOLT? gave {reading!r} with errors {alone}, not a "
+                         "timeout: a load seems to be connected to the board, or the bus is in use. "
+                         "Refusing to run, this test switches the input on.")
     try:
+        # Is it the simulator that answers now? It is told to report a voltage
+        # that no real supply would show by chance.
+        sim.start("--source-mv", "12345")
+        t = Scpi(host)
+        reading = t.query("MEAS:VOLT?")
+        t.close()
+        if reading != "12.345":
+            raise SystemExit(f"With the simulator running, MEAS:VOLT? gave {reading!r}, not its 12.345: "
+                             "the gateway is not talking to the simulator. Refusing to run.")
+
         print("Simulated load, plain link")
         sim.start()
         t = Scpi(host)
@@ -190,30 +173,16 @@ def main():
 
         print("Raw port")
         raw = socket.create_connection((host, RAW_PORT), timeout=5)
-        raw.settimeout(2)
         time.sleep(0.3)
-        raw.sendall(bytes.fromhex("01 03 00 01 00 04 15 c9"))
-        got = b""
-        try:
-            while len(got) < 9:
-                got += raw.recv(64)
-        except socket.timeout:
-            pass
-        check("raw client reads the model register", got == bytes.fromhex("01 03 04 00 00 07 30 f8 17"), got.hex(" "))
+        got = raw_exchange(raw, MODEL_READ, len(MODEL_REPLY))
+        check("raw client reads the model register", got == MODEL_REPLY, got.hex(" "))
         expect_error(t, "MEAS:VOLT?", 100)      # the raw client owns the RS485 port
         check("*IDN? still answers", bool(t.query("*IDN?")))
         # On the raw port the newest client takes over and the old one is closed.
         raw2 = socket.create_connection((host, RAW_PORT), timeout=5)
-        raw2.settimeout(2)
         time.sleep(0.3)
-        raw2.sendall(bytes.fromhex("01 03 00 01 00 04 15 c9"))
-        got = b""
-        try:
-            while len(got) < 9:
-                got += raw2.recv(64)
-        except socket.timeout:
-            pass
-        check("a second raw client takes over", got == bytes.fromhex("01 03 04 00 00 07 30 f8 17"), got.hex(" "))
+        got = raw_exchange(raw2, MODEL_READ, len(MODEL_REPLY))
+        check("a second raw client takes over", got == MODEL_REPLY, got.hex(" "))
         check("... and the first is closed", rejected_after(raw))
         raw2.close()
         raw.close()
@@ -295,8 +264,7 @@ def main():
         t.close()
     finally:
         sim.stop()
-    print(f"\n{sum(results)} of {len(results)} checks passed")
-    return 0 if all(results) else 1
+    return check.summary()
 
 
 if __name__ == "__main__":
