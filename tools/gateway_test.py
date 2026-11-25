@@ -116,6 +116,17 @@ def rejected(host, port):
     return closed
 
 
+def rejected_after(s):
+    """True if an open connection has been closed by the gateway."""
+    s.settimeout(2)
+    try:
+        return s.recv(16) == b""
+    except ConnectionError:
+        return True
+    except socket.timeout:
+        return False
+
+
 def main():
     soak = 0
     if "--soak" in sys.argv:
@@ -189,9 +200,22 @@ def main():
         except socket.timeout:
             pass
         check("raw client reads the model register", got == bytes.fromhex("01 03 04 00 00 07 30 f8 17"), got.hex(" "))
-        check("second raw client is turned away", rejected(host, RAW_PORT))
         expect_error(t, "MEAS:VOLT?", 100)      # the raw client owns the RS485 port
         check("*IDN? still answers", bool(t.query("*IDN?")))
+        # On the raw port the newest client takes over and the old one is closed.
+        raw2 = socket.create_connection((host, RAW_PORT), timeout=5)
+        raw2.settimeout(2)
+        time.sleep(0.3)
+        raw2.sendall(bytes.fromhex("01 03 00 01 00 04 15 c9"))
+        got = b""
+        try:
+            while len(got) < 9:
+                got += raw2.recv(64)
+        except socket.timeout:
+            pass
+        check("a second raw client takes over", got == bytes.fromhex("01 03 04 00 00 07 30 f8 17"), got.hex(" "))
+        check("... and the first is closed", rejected_after(raw))
+        raw2.close()
         raw.close()
         time.sleep(0.5)
         expect(t, "MEAS:VOLT?", "24.031")

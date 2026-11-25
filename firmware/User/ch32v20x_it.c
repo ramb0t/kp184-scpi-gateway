@@ -12,6 +12,7 @@
 #include "ch32v20x_it.h"
 #include "eth_driver.h"
 #include "bsp_uart.h"
+#include "wdg.h"
 
 void NMI_Handler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 void HardFault_Handler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
@@ -66,6 +67,7 @@ void ETH_IRQHandler(void)
 void TIM2_IRQHandler(void)
 {
     WCHNET_TimeIsr(WCHNETTIMERPERIOD);
+    Uptime_ms += WCHNETTIMERPERIOD;
     TIM_ClearITPendingBit(TIM2, TIM_IT_Update);
 }
 

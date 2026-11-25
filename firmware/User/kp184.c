@@ -2,6 +2,7 @@
 #include "kp184.h"
 #include "bsp_uart.h"
 #include "tick.h"
+#include "netsock.h"
 #include "eth_driver.h"
 
 /* The load starts answering 5 to 8 ms after a request. */
@@ -44,7 +45,7 @@ static void settle_bus(void)
     while(Tick_Since(t0) < SETTLE_LIMIT)
     {
         Uart_TxKick();
-        WCHNET_MainTask();
+        Net_Service();
         if(!Uart_TxIdle() || Uart_RxPeek(&p))
         {
             Uart_RxFlush();
@@ -108,7 +109,7 @@ static kp184_err_t xfer_once(const uint8_t *req, uint8_t reqlen, uint8_t *frame,
     while(Uart_RxPeek(&p) == 0)
     {
         if(Tick_Since(t0) > REPLY_TIMEOUT) return KP184_ERR_TIMEOUT;
-        WCHNET_MainTask();
+        Net_Service();
     }
     t0 = first = Tick_Now();
     for(;;)
@@ -161,7 +162,7 @@ static kp184_err_t xfer(const uint8_t *req, uint8_t reqlen, uint8_t *frame, uint
     {
         /* Every request only reads or sets a value, so repeating one is harmless. */
         t0 = Tick_Now();
-        while(Tick_Since(t0) < RETRY_PAUSE) WCHNET_MainTask();
+        while(Tick_Since(t0) < RETRY_PAUSE) Net_Service();
         r = xfer_once(req, reqlen, frame, replylen);
     }
     return r;

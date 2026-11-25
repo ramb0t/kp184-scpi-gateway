@@ -1,6 +1,13 @@
 #include <string.h>
 #include "netsock.h"
 #include "eth_driver.h"
+#include "wdg.h"
+
+void Net_Service(void)
+{
+    WCHNET_MainTask();
+    Wdg_Feed();
+}
 
 void Net_SessionStart(net_session_t *s, uint8_t id)
 {

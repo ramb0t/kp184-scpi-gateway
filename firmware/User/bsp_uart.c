@@ -11,6 +11,7 @@
 *******************************************************************************/
 #include "bsp_uart.h"
 #include "tick.h"
+#include "netsock.h"
 #include "eth_driver.h"
 
 /* Global Variable */
@@ -276,7 +277,7 @@ void Uart_SendBlocking(const uint8_t *buf, uint16_t len)
     while((uart_data_t.uart_tx_dma_state != IDLE) || (uart_data_t.tx_remainBuffNum < UART_TX_BUF_NUM))
     {
         Uart_TxKick();
-        WCHNET_MainTask();
+        Net_Service();
         if(Tick_Since(t0) > TICK_MS(3000))
         {
             tx_abort();
@@ -287,7 +288,7 @@ void Uart_SendBlocking(const uint8_t *buf, uint16_t len)
     t0 = Tick_Now();
     while(!Uart_BusQuiet())
     {
-        WCHNET_MainTask();
+        Net_Service();
         if(Tick_Since(t0) > TICK_MS(100)) break;
     }
     while(len--)

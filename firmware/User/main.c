@@ -25,6 +25,7 @@ While a raw client is connected it owns the RS485 port and SCPI commands that ne
 #include "scpi_server.h"
 #include "netsock.h"
 #include "tick.h"
+#include "wdg.h"
 
 #define SCPI_PORT      5025                                 //IANA "scpi-raw"
 #define RAW_PORT       4001                                 //transparent TCP-to-serial port
@@ -208,6 +209,15 @@ void WCHNET_HandleSockInt(u8 socketid,u8 intstat)
         if(Raw.active && !Net_SessionOwnsSlot(&Raw)) RawEnd();
         Scpi_Check();
 
+        /* On the raw port the newest client wins, as with ser2net's
+         * kickolduser: a client that lost its connection without closing it
+         * would otherwise lock everyone out until keepalive notices (25 s). */
+        if((port == RAW_PORT) && Raw.active)
+        {
+            if(Net_SessionOpen(&Raw)) WCHNET_SocketClose(Raw.id, TCP_CLOSE_NORMAL);
+            RawEnd();
+        }
+
         if((port == RAW_PORT) && !Raw.active)
         {
             Net_SessionStart(&Raw, socketid);
@@ -376,8 +386,18 @@ int main(void)
     }
     else {
         printf("WCHNET_LibInit failed, halted\r\n");
-        while(1);
+        while(1);                                       //the watchdog is not running yet, so this stays
     }
+    Wdg_Init();
+    printf("reset cause: %s\r\n", Wdg_ResetCause());
+
+    /* Whatever the board was doing before this start, the load's input goes
+     * off: after a hang, a power cut or a reflash nobody may be watching it. */
+    for(i = 0; i < 3; i++)
+    {
+        if(KP184_Write(KP184_REG_OUTPUT, 0) == KP184_OK) break;
+    }
+    printf("boot input off: %s\r\n", (i < 3) ? "done" : "load not answering");
 
     /* Each port takes one client, so one that vanished must be noticed quickly
      * or it blocks the next: probe after 10 s idle, give up after 3 x 5 s. */
@@ -394,8 +414,8 @@ int main(void)
 	while(1)
 	{
         /*Ethernet library main task function,
-         * which needs to be called cyclically*/
-	    WCHNET_MainTask();
+         * which needs to be called cyclically; also feeds the watchdog*/
+	    Net_Service();
         /*Query the Ethernet global interrupt,
          * if there is an interrupt, call the global interrupt handler*/
         if(WCHNET_QueryGlobalInt())

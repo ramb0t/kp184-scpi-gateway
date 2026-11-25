@@ -6,6 +6,7 @@
 #   make                       build build/eth485/eth485.{elf,bin,hex} from firmware/
 #   make EXAMPLE=DHCP          build an SDK example instead (DHCP or ETH_UART)
 #   make flash [EXAMPLE=...]   program over WCH-Link with wlink, read back, compare and reset
+#   make EXTRA_CFLAGS=-DWDG_TEST  test build with DIAG:HANG, which stops feeding the watchdog
 
 TOOLCHAIN ?= $(HOME)/toolchains/wch-riscv-gcc12/bin/riscv-wch-elf-
 WLINK     ?= wlink
@@ -60,7 +61,8 @@ ARCH    := -march=rv32imac_xw -mabi=ilp32 -msmall-data-limit=8 -msave-restore
 CFLAGS  := $(ARCH) -Os -g -std=gnu99 -fmessage-length=0 -fsigned-char \
            -ffunction-sections -fdata-sections -fno-common -Wunused \
            -DCH32V20x_D8W -DDEBUG=$(DEBUG_UART) $(APP_FLAGS) \
-           -I$(APP)/User -I$(SRC)/Core -I$(SRC)/Debug -I$(SRC)/Peripheral/inc -I$(NET)
+           -I$(APP)/User -I$(SRC)/Core -I$(SRC)/Debug -I$(SRC)/Peripheral/inc -I$(NET) \
+           $(EXTRA_CFLAGS)
 LDFLAGS := $(ARCH) -T $(APP)/Ld/Link.ld -nostartfiles -Wl,--gc-sections \
            -Wl,-Map=$(OUT)/$(NAME).map -Wl,--print-memory-usage \
            --specs=nano.specs --specs=nosys.specs -L$(NET)
@@ -93,7 +95,10 @@ $(OUT):
 	mkdir -p $@
 
 # Link.ld places flash at 0, the alias of 0x08000000, so the address is given explicitly.
+# Reset and halt first: the watchdog is off after a reset and the firmware
+# never gets to start it, so it cannot bite while the flash is written.
 flash: $(OUT)/$(NAME).bin
+	$(WLINK) reset halt
 	$(WLINK) flash --address 0x08000000 $<
 	$(WLINK) dump 0x08000000 $$(stat -c %s $<) --out $(OUT)/readback.bin
 	cmp -n $$(stat -c %s $<) $< $(OUT)/readback.bin && echo "readback matches"

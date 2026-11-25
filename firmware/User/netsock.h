@@ -28,4 +28,9 @@ uint8_t  Net_SessionOpen(const net_session_t *s);      /* ... and the connection
 uint32_t Net_SessionPending(const net_session_t *s);   /* unread bytes */
 uint32_t Net_SessionRead(net_session_t *s, uint8_t *dst, uint32_t max);
 
+/* Run the network stack and feed the watchdog. Every wait that can last more
+ * than a few milliseconds calls this, so the stack keeps running during a
+ * transfer and only a real hang trips the watchdog. */
+void     Net_Service(void);
+
 #endif

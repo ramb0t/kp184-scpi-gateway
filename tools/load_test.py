@@ -7,7 +7,8 @@ Switches the load's input on at small currents (0.1 A up to --max-current) in
 CC, CR and CW mode, so the supply must tolerate that. Never CV with the input
 on: below the supply voltage a CV load sinks as much current as it can.
 
-Safety: the input is switched off and checked after every step, any current
+Safety: the input is switched off and checked after every step (the fail-safe
+tests leave it on across a reconnect for a second or so), any current
 reading above 1.5 x --max-current switches it off and aborts, the CV setpoint
 is parked at 150 V before anything is switched on, and the load's original
 mode and setpoints are restored at the end with the input off.
@@ -215,13 +216,45 @@ def main():
         ld.write("*RST")
         time.sleep(0.4)
         check("*RST switches the input off", ld.query("INP?") == "0")
+        check("no errors", ld.errors() == [])
+
+        print("Fail-safe")
+        check("SYST:FAIL? -> 1 by default", ld.query("SYST:FAIL?") == "1")
         ld.write("INP ON")
         time.sleep(0.5)
         ld.close()                                      # dropped without INP OFF
         ld.connect()
-        check("the input stays on after the client disconnects", ld.query("INP?") == "1")
-        check("input off", ld.off())
+        check("the input goes off when the client that switched it on leaves", ld.query("INP?") == "0")
+        ld.write("SYST:FAIL OFF")
+        ld.write("INP ON")
+        time.sleep(0.5)
+        ld.close()
+        ld.connect()
+        check("with SYST:FAIL OFF the input stays on after the client leaves", ld.query("INP?") == "1")
+        check("SYST:FAIL? -> 1 again for the new client", ld.query("SYST:FAIL?") == "1")
+        ld.close()                                      # this client never switched it on
+        ld.connect()
+        check("a client that did not switch the input on leaves it alone", ld.query("INP?") == "1")
+        ld.write("INP ON")                              # now this client owns it
+        raw = socket.create_connection((host, 4001), timeout=5)
+        time.sleep(0.3)
+        ld.close()                                      # the raw client holds the bus: fail-safe must wait
+        raw.sendall(bytes.fromhex("01 03 03 00 00 00 45 8e"))     # status block, read by the raw client
+        raw.settimeout(1)
+        status = b""
+        try:
+            while len(status) < 23:
+                status += raw.recv(64)
+        except socket.timeout:
+            pass
+        check("fail-safe waits while a raw client holds the bus", len(status) == 23 and status[3] & 1 == 1,
+              status.hex(" "))
+        raw.close()
+        time.sleep(0.6)
+        ld.connect()
+        check("... and switches the input off once the raw client has gone", ld.query("INP?") == "0")
         check("no errors", ld.errors() == [])
+        print("  diagnostics: reset cause", ld.query("DIAG:RES:CAUS?"), "| uptime", ld.query("DIAG:UPT?"), "s")
     except Abort as e:
         check(f"ABORTED: {e}", False)
     finally:

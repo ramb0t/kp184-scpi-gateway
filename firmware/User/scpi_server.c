@@ -11,6 +11,15 @@
  *   MEASure[:SCALar]:{VOLTage|CURRent|POWer|RESistance}[:DC]?     also as FETCh
  *   *IDN? *RST *TST? *CLS *ESE *ESR? *OPC *SRE *STB? *WAI, SYSTem:ERRor?
  *
+ *   [:SOURce]:{CURRent|VOLTage|RESistance|POWer}:{IRANGe|VRANGe}?   40 and 150: the
+ *       KP184's single range. ngscopeclient's siglent_load driver asks for these
+ *       and fails without an answer. Setting a range is not accepted (-113).
+ *
+ * Gateway-specific:
+ *   SYSTem:FAILsafe[:STATe] {ON|OFF} and ?   input off when this client goes away (default ON)
+ *   DIAGnostic:UPTime?                       seconds since the gateway started
+ *   DIAGnostic:RESet:CAUSe?                  POWER, PIN, WATCHDOG or SOFTWARE
+ *
  * *RST switches the input off and changes nothing else.
  * Numbers are written as fixed-point text from the load's integer counts, so
  * nothing here depends on floating-point formatting. */
@@ -22,6 +31,7 @@
 #include "netsock.h"
 #include "kp184.h"
 #include "tick.h"
+#include "wdg.h"
 
 #define FW_VERSION          "eth485-0.2"
 
@@ -74,8 +84,46 @@ static uint8_t closing;             /* the client has closed: run what it sent, 
 static uint16_t line_len;           /* bytes of the current line handed to the parser */
 static uint8_t discarding;          /* dropping the rest of an overlong line */
 
+/* Fail-safe: when a client that switched the input on goes away without
+ * switching it off (closed, timed out, network gone), the gateway switches it
+ * off. A client can opt out for its own session with SYST:FAIL OFF, e.g. to
+ * start a long run and disconnect. Clients that never switched the input on
+ * leave it alone, so a monitoring client does not stop someone else's run. */
+static uint8_t failsafe;            /* this session's setting, ON at each connect */
+static uint8_t turned_on;           /* this session switched the input on and has not switched it off */
+static uint8_t failsafe_pending;    /* switch the input off as soon as the bus is free */
+static uint8_t failsafe_tries;
+
 /* Longest line accepted, terminator included, with room to spare in the parser's buffer. */
 #define LINE_LIMIT          (INPUT_BUFFER_LEN - 8)
+
+/* --- session end ------------------------------------------------------------ */
+
+static void session_end(void)
+{
+    if(connected && failsafe && turned_on)
+    {
+        failsafe_pending = 1;
+        failsafe_tries = 0;
+    }
+    connected = 0;
+    sess.active = 0;
+}
+
+/* Called from Scpi_Poll(). Busy (a raw client holds the bus) keeps it pending;
+ * a load that does not answer gets three tries. */
+static void failsafe_run(void)
+{
+    kp184_err_t r;
+
+    if(!failsafe_pending) return;
+    r = KP184_Write(KP184_REG_OUTPUT, 0);
+    if((r == KP184_OK) || ((r != KP184_ERR_BUSY) && (++failsafe_tries >= 3)))
+    {
+        failsafe_pending = 0;
+        printf("fail-safe input off: %s\r\n", (r == KP184_OK) ? "done" : "load not answering");
+    }
+}
 
 /* --- output to the TCP connection ----------------------------------------- */
 
@@ -98,10 +146,10 @@ static void send_output(void)
                 /* A reply cut short would run into the next one and read as a
                  * different number, so drop this client instead. */
                 WCHNET_SocketClose(sock, TCP_CLOSE_RST);
-                connected = 0;
+                session_end();
                 break;
             }
-            WCHNET_MainTask();
+            Net_Service();
         }
     }
     output_len = 0;
@@ -222,7 +270,10 @@ static void result_fixed(scpi_t *context, uint64_t value, uint8_t decimals)
 
 static scpi_result_t scpi_reset(scpi_t *context)
 {
-    return bus_result(context, KP184_Write(KP184_REG_OUTPUT, 0));
+    kp184_err_t r = KP184_Write(KP184_REG_OUTPUT, 0);
+
+    if(r == KP184_OK) turned_on = 0;
+    return bus_result(context, r);
 }
 
 /* *TST? is 0 when the load answers and identifies as a KP184, otherwise 1.
@@ -267,7 +318,7 @@ static scpi_result_t cmd_function(scpi_t *context)
     if(r == KP184_OK)
     {
         t0 = Tick_Now();
-        while(Tick_Since(t0) < MODE_SETTLE) WCHNET_MainTask();
+        while(Tick_Since(t0) < MODE_SETTLE) Net_Service();
         r = KP184_Read(KP184_REG_MODE, &now);
     }
     if(r != KP184_OK) return bus_result(context, r);
@@ -395,8 +446,56 @@ static scpi_result_t cmd_input(scpi_t *context)
         return SCPI_RES_ERR;
     }
     if(!params_done(context)) return SCPI_RES_ERR;
-    return bus_result(context, KP184_Write(KP184_REG_OUTPUT, on));
+    if(bus_result(context, KP184_Write(KP184_REG_OUTPUT, on)) != SCPI_RES_OK) return SCPI_RES_ERR;
+    turned_on = on;
+    return SCPI_RES_OK;
 }
+
+/* --- gateway-specific --------------------------------------------------------- */
+
+static scpi_result_t cmd_failsafe(scpi_t *context)
+{
+    scpi_bool_t on;
+
+    if(!SCPI_ParamBool(context, &on, TRUE)) return SCPI_RES_ERR;
+    if(!params_done(context)) return SCPI_RES_ERR;
+    failsafe = on ? 1 : 0;
+    return SCPI_RES_OK;
+}
+
+static scpi_result_t cmd_failsafe_q(scpi_t *context)
+{
+    SCPI_ResultInt32(context, failsafe);
+    return SCPI_RES_OK;
+}
+
+/* The KP184 has one range: 40 A and 150 V full scale. */
+static scpi_result_t cmd_range_q(scpi_t *context)
+{
+    SCPI_ResultInt32(context, SCPI_CmdTag(context) ? 150 : 40);
+    return SCPI_RES_OK;
+}
+
+static scpi_result_t cmd_uptime_q(scpi_t *context)
+{
+    SCPI_ResultUInt32Base(context, Uptime_ms / 1000, 10);
+    return SCPI_RES_OK;
+}
+
+static scpi_result_t cmd_reset_cause_q(scpi_t *context)
+{
+    SCPI_ResultMnemonic(context, Wdg_ResetCause());
+    return SCPI_RES_OK;
+}
+
+#ifdef WDG_TEST
+/* Test builds only: stop feeding the watchdog. */
+static scpi_result_t cmd_hang(scpi_t *context)
+{
+    (void)context;
+    for(;;);
+}
+#endif
 
 static scpi_result_t cmd_input_q(scpi_t *context)
 {
@@ -478,6 +577,23 @@ static const scpi_command_t commands[] = {
     {"FETCh[:SCALar]:POWer[:DC]?", cmd_measure_q, MEAS_POW},
     {"FETCh[:SCALar]:RESistance[:DC]?", cmd_measure_q, MEAS_RES},
 
+    {"[:SOURce]:CURRent:IRANGe?", cmd_range_q, 0},
+    {"[:SOURce]:VOLTage:IRANGe?", cmd_range_q, 0},
+    {"[:SOURce]:RESistance:IRANGe?", cmd_range_q, 0},
+    {"[:SOURce]:POWer:IRANGe?", cmd_range_q, 0},
+    {"[:SOURce]:CURRent:VRANGe?", cmd_range_q, 1},
+    {"[:SOURce]:VOLTage:VRANGe?", cmd_range_q, 1},
+    {"[:SOURce]:RESistance:VRANGe?", cmd_range_q, 1},
+    {"[:SOURce]:POWer:VRANGe?", cmd_range_q, 1},
+
+    {"SYSTem:FAILsafe[:STATe]", cmd_failsafe, 0},
+    {"SYSTem:FAILsafe[:STATe]?", cmd_failsafe_q, 0},
+    {"DIAGnostic:UPTime?", cmd_uptime_q, 0},
+    {"DIAGnostic:RESet:CAUSe?", cmd_reset_cause_q, 0},
+#ifdef WDG_TEST
+    {"DIAGnostic:HANG", cmd_hang, 0},
+#endif
+
     SCPI_CMD_LIST_END
 };
 
@@ -507,6 +623,8 @@ void Scpi_Connect(uint8_t socketid)
     line_len = 0;
     discarding = 0;
     closing = 0;
+    failsafe = 1;
+    turned_on = 0;
     SCPI_ErrorClear(&ctx);
     connected = 1;
 }
@@ -522,8 +640,7 @@ void Scpi_Disconnect(void)
         while(connected && Net_SessionPending(&sess)) Scpi_Poll();
     }
     closing = 0;
-    connected = 0;
-    sess.active = 0;
+    session_end();
 }
 
 void Scpi_Close(void)
@@ -535,11 +652,7 @@ void Scpi_Close(void)
 
 void Scpi_Check(void)
 {
-    if(connected && !Net_SessionOwnsSlot(&sess))
-    {
-        connected = 0;
-        sess.active = 0;
-    }
+    if(connected && !Net_SessionOwnsSlot(&sess)) session_end();
 }
 
 uint8_t Scpi_IsConnected(void)
@@ -599,6 +712,7 @@ void Scpi_Poll(void)
     static uint8_t chunk[128];
     uint32_t len;
 
+    if(!closing) failsafe_run();
     if(!connected) return;
     if(!Net_SessionOwnsSlot(&sess))
     {
@@ -610,7 +724,6 @@ void Scpi_Poll(void)
     if(connected && !closing && !Net_SessionOpen(&sess) && !Net_SessionPending(&sess))
     {
         /* Closed and fully read. */
-        connected = 0;
-        sess.active = 0;
+        session_end();
     }
 }
