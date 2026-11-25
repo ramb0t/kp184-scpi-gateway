@@ -1,19 +1,21 @@
-# Builds one of WCH's CH32V208 Ethernet examples from a pinned SDK checkout.
-# Flags mirror the example's MounRiver project (.cproject): rv32imac + WCH xw, ilp32, -Os, newlib-nano.
+# Builds the eth485 bridge firmware in firmware/, or one of WCH's unmodified CH32V208 Ethernet
+# examples, against a pinned SDK checkout.
+# Flags mirror the examples' MounRiver project (.cproject): rv32imac + WCH xw, ilp32, -Os, newlib-nano.
 #
 #   make sdk                   fetch the SDK subset into third_party/ (once)
-#   make [EXAMPLE=DHCP]        build build/<EXAMPLE>/<EXAMPLE>.{elf,bin,hex}
-#   make flash [EXAMPLE=...]   program over WCH-Link with wlink, then read back and compare
+#   make                       build build/eth485/eth485.{elf,bin,hex} from firmware/
+#   make EXAMPLE=DHCP          build an SDK example instead (DHCP or ETH_UART)
+#   make flash [EXAMPLE=...]   program over WCH-Link with wlink, read back, compare and reset
 
-EXAMPLE   ?= DHCP
 TOOLCHAIN ?= $(HOME)/toolchains/wch-riscv-gcc12/bin/riscv-wch-elf-
 WLINK     ?= wlink
-# UART the examples' printf goes to: 1 = PA9, 2 = PA2, 3 = PB10. The board's TXD/RXD header is
-# USART2 (PA2/PA3), so that is the default, except for ETH_UART, which uses USART2 for its data.
-ifeq ($(EXAMPLE),ETH_UART)
-DEBUG_UART ?= 1
-else
+# UART that printf goes to: 1 = PA9, 2 = PA2, 3 = PB10. The board's TXD/RXD header is USART2
+# (PA2/PA3). The bridge and ETH_UART carry data on it, so their printf stays on PA9, which is
+# not on a header; only the DHCP example prints where it can be seen.
+ifeq ($(EXAMPLE),DHCP)
 DEBUG_UART ?= 2
+else
+DEBUG_UART ?= 1
 endif
 
 SDK_URL := https://github.com/openwch/ch32v20x.git
@@ -24,8 +26,14 @@ SDK_SUBSET := EVT/EXAM/SRC EVT/EXAM/ETH/NetLib EVT/EXAM/ETH/DHCP EVT/EXAM/ETH/ET
 EXAM := $(SDK_DIR)/EVT/EXAM
 SRC  := $(EXAM)/SRC
 NET  := $(EXAM)/ETH/NetLib
+ifdef EXAMPLE
 APP  := $(EXAM)/ETH/$(EXAMPLE)
-OUT  := build/$(EXAMPLE)
+NAME := $(EXAMPLE)
+else
+APP  := firmware
+NAME := eth485
+endif
+OUT  := build/$(NAME)
 
 CC      := $(TOOLCHAIN)gcc
 OBJCOPY := $(TOOLCHAIN)objcopy
@@ -45,15 +53,15 @@ CFLAGS  := $(ARCH) -Os -g -std=gnu99 -fmessage-length=0 -fsigned-char \
            -DCH32V20x_D8W -DDEBUG=$(DEBUG_UART) \
            -I$(APP)/User -I$(SRC)/Core -I$(SRC)/Debug -I$(SRC)/Peripheral/inc -I$(NET)
 LDFLAGS := $(ARCH) -T $(APP)/Ld/Link.ld -nostartfiles -Wl,--gc-sections \
-           -Wl,-Map=$(OUT)/$(EXAMPLE).map -Wl,--print-memory-usage \
+           -Wl,-Map=$(OUT)/$(NAME).map -Wl,--print-memory-usage \
            --specs=nano.specs --specs=nosys.specs -L$(NET)
 LDLIBS  := -lwchnet
 
 .PHONY: all sdk flash clean FORCE
-all: $(OUT)/$(EXAMPLE).bin $(OUT)/$(EXAMPLE).hex
-	$(SIZE) $(OUT)/$(EXAMPLE).elf
+all: $(OUT)/$(NAME).bin $(OUT)/$(NAME).hex
+	$(SIZE) $(OUT)/$(NAME).elf
 
-$(OUT)/$(EXAMPLE).elf: $(OBJS) $(NET)/libwchnet.a $(APP)/Ld/Link.ld
+$(OUT)/$(NAME).elf: $(OBJS) $(NET)/libwchnet.a $(APP)/Ld/Link.ld
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 %.bin: %.elf
@@ -76,7 +84,7 @@ $(OUT):
 	mkdir -p $@
 
 # Link.ld places flash at 0, the alias of 0x08000000, so the address is given explicitly.
-flash: $(OUT)/$(EXAMPLE).bin
+flash: $(OUT)/$(NAME).bin
 	$(WLINK) flash --address 0x08000000 $<
 	$(WLINK) dump 0x08000000 $$(stat -c %s $<) --out $(OUT)/readback.bin
 	cmp -n $$(stat -c %s $<) $< $(OUT)/readback.bin && echo "readback matches"
