@@ -11,17 +11,22 @@
 *******************************************************************************/
 /*
  *@Note
-eth485: WCH's ETH_UART example changed to take its address by DHCP and to listen as a TCP server.
-One client at a time connects to LISTEN_PORT; bytes pass transparently between that socket and USART2
-(PA2 TX, PA3 RX) at BAUD_RATE (bsp_uart.h).
-For details on the selection of engineering chips,
-please refer to the "CH32V20x Evaluation Board Manual" under the CH32V20xEVT\EVT\PUB folder.
+eth485: network gateway for a Kunkin KP184 electronic load on RS485, grown from WCH's ETH_UART example.
+The board takes its address by DHCP and listens on two TCP ports, one client each:
+  SCPI_PORT  a SCPI command interpreter that talks to the load itself (scpi_server.c, kp184.c)
+  RAW_PORT   bytes passed straight between the socket and USART2 (PA2 TX, PA3 RX) at BAUD_RATE,
+             for software that speaks the load's own protocol
+While a raw client is connected it owns the RS485 port and SCPI commands that need the load fail.
 */
 #include "string.h"
 #include "eth_driver.h"
 #include "bsp_uart.h"
+#include "kp184.h"
+#include "scpi_server.h"
+#include "tick.h"
 
-#define LISTEN_PORT    4001                                 //TCP port the bridge listens on
+#define SCPI_PORT      5025                                 //IANA "scpi-raw"
+#define RAW_PORT       4001                                 //transparent TCP-to-serial port
 #define DHCP_HOSTNAME  "eth485"                             //name offered to the DHCP server
 
 u8 MACAddr[6];                                              //MAC address
@@ -29,12 +34,11 @@ u8 IPAddr[4]   = {0, 0, 0, 0};                              //IP address, filled
 u8 GWIPAddr[4] = {0, 0, 0, 0};                              //Gateway IP address, filled in by DHCP
 u8 IPMask[4]   = {0, 0, 0, 0};                              //subnet mask, filled in by DHCP
 
-u8 SocketIdForListen;                                       //listening socket id
-u8 ListenValid = 0;                                         //1 once the listening socket exists
-u8 SocketId;                                                //socket id of the connected client
-u8 SocketRecvBuf[RECE_BUF_LEN];                             //socket data buff
-
-u8 TCPConnValid = 0;                                        //0 disconnected  1 connect
+u8 ListenValid = 0;                                         //1 once the listening sockets exist
+u8 RawSocket;                                               //socket id of the raw client
+u8 RawConnected = 0;                                        //0 disconnected  1 connect
+u8 RawRecvBuf[RECE_BUF_LEN];                                //receive buffer of the raw connection
+u8 ScpiRecvBuf[SCPI_RECV_BUF_LEN];                          //receive buffer of the SCPI connection
 
 u32 ethRxDropCnt = 0;                                   //frames dropped because no TX buffer was free
 /*********************************************************************
@@ -80,101 +84,56 @@ void TIM2_Init( void )
 /*********************************************************************
  * @fn      WCHNET_CreateTcpSocketListen
  *
- * @brief   Create the TCP socket that listens on LISTEN_PORT
+ * @brief   Create a TCP socket that listens on the given port
  *
- * @return  none
+ * @return  1 on success
  */
-void WCHNET_CreateTcpSocketListen(void)
+u8 WCHNET_CreateTcpSocketListen(u16 port)
 {
-    u8 i;
+    u8 i, id;
     SOCK_INF TmpSocketInf;
 
     memset((void *)&TmpSocketInf,0,sizeof(SOCK_INF));
-    TmpSocketInf.SourPort = LISTEN_PORT;
+    TmpSocketInf.SourPort = port;
     TmpSocketInf.ProtoType = PROTO_TYPE_TCP;
-    i = WCHNET_SocketCreat(&SocketIdForListen,&TmpSocketInf);
+    i = WCHNET_SocketCreat(&id,&TmpSocketInf);
     mStopIfError(i);
     if(i != WCHNET_ERR_SUCCESS){
-        return;
+        return 0;
     }
-    printf("SocketIdForListen %d\r\n",SocketIdForListen);
-    i = WCHNET_SocketListen(SocketIdForListen);
+    printf("listen %d on socket %d\r\n",port,id);
+    i = WCHNET_SocketListen(id);
     mStopIfError(i);
-    if(i == WCHNET_ERR_SUCCESS){
-        ListenValid = 1;
-    }
+    return (i == WCHNET_ERR_SUCCESS);
 }
-
 
 /*********************************************************************
  * @fn      uartRxAndSendDataToETH
  *
- * @brief   uart receive data, and send these data to eth. The send length
- *          is in/out: only the bytes actually handed to the stack are
- *          consumed, so a send that could not be queued is retried by the
- *          next call instead of being dropped.
+ * @brief   Raw port: send what the uart received to the client. Only the
+ *          bytes actually handed to the stack are consumed, so a send that
+ *          could not be queued is retried by the next call.
  *
  * @return  none
  */
 void uartRxAndSendDataToETH(void)
 {
     u8 *p;
-    u8 ret;
-    uint32_t temp = 0;
-    uint32_t len = 0;
-    uint32_t readindex = 0;
+    uint32_t len;
 
-    temp = DMA1_Channel6->CNTR;
-
-    /* uart rx dma CNTR not equal to last, indicating that data is received*/
-    if(temp != uart_data_t.last_RX_DMA_length)
+    len = Uart_RxPeek(&p);
+    if(len == 0) return;
+    if((WCHNET_SocketSend(RawSocket, p, &len) != WCHNET_ERR_SUCCESS) || (len == 0))
     {
-        if(temp < uart_data_t.last_RX_DMA_length)
-        {
-            len = uart_data_t.last_RX_DMA_length - temp;
-        }
-        else {
-            len = uart_data_t.last_RX_DMA_length;
-        }
-        readindex = UART_RX_DMA_SIZE - uart_data_t.last_RX_DMA_length;
-        p = &uart_data_t.RX_buffer[readindex];
-        ret = WCHNET_SocketSend(SocketId, p, &len);
-        if((ret != WCHNET_ERR_SUCCESS) || (len == 0))
-        {
-            return;
-        }
-        uart_data_t.last_RX_DMA_length -= len;
-        if(uart_data_t.last_RX_DMA_length == 0)
-            uart_data_t.last_RX_DMA_length = UART_RX_DMA_SIZE;
+        return;
     }
-}
-
-/*********************************************************************
- * @fn      uartTx
- *
- * @brief   send data from TX_buffer by uart tx dma
- *
- * @return  none
- */
-void uartTx(void)
-{
-    if(uart_data_t.uart_tx_dma_state == IDLE)
-    {
-        /* eth has received data  */
-        if(uart_data_t.tx_remainBuffNum < UART_TX_BUF_NUM)
-        {
-            DMA1_Channel7->MADDR = (uint32_t) &uart_data_t.TX_buffer[uart_data_t.tx_read];
-            DMA1_Channel7->CNTR = uart_data_t.TX_data_length[uart_data_t.tx_read];
-            uart_data_t.uart_tx_dma_state = BUSY;
-            DMA_Cmd(DMA1_Channel7,ENABLE);
-        }
-    }
+    Uart_RxConsume(len);
 }
 
 /*********************************************************************
  * @fn      ETHRx
  *
- * @brief   ETH receive data and save it to buff.
+ * @brief   Raw port: take data received from the client into a uart TX buffer.
  *
  * @param   socketid - socket id.
  *
@@ -212,7 +171,29 @@ void ETHRx(u8 socketid)
         ethRxDropCnt++;
         printf("eth receive buff busy, drop count: %u\r\n", (unsigned)ethRxDropCnt);
     }
-    uartTx();
+    Uart_TxKick();
+}
+
+/*********************************************************************
+ * @fn      CloseClients
+ *
+ * @brief   Drop both client connections; the listening sockets stay.
+ *
+ * @return  none
+ */
+void CloseClients(void)
+{
+    if(RawConnected)
+    {
+        RawConnected = 0;
+        KP184_BusLocked = 0;
+        WCHNET_SocketClose(RawSocket, TCP_CLOSE_NORMAL);
+    }
+    if(Scpi_IsConnected())
+    {
+        Scpi_Disconnect();
+        WCHNET_SocketClose(Scpi_Socket(), TCP_CLOSE_NORMAL);
+    }
 }
 
 /*********************************************************************
@@ -227,29 +208,63 @@ void ETHRx(u8 socketid)
  */
 void WCHNET_HandleSockInt(u8 socketid,u8 intstat)
 {
-    if(intstat & SINT_STAT_RECV)                        //receive data
-    {
-        ETHRx(socketid);
-    }
+    u32 len;
+
+    /* Connect is handled before receive: both can be flagged at once. */
     if(intstat & SINT_STAT_CONNECT)                     //a client connected; socketid is the accepted socket
     {
-        SocketId = socketid;
-        WCHNET_SocketSetKeepLive(socketid, ENABLE);
-        WCHNET_ModifyRecvBuf(socketid, (u32)SocketRecvBuf, RECE_BUF_LEN);
-        /* Forget UART bytes that arrived while nobody was connected. */
-        uart_data_t.last_RX_DMA_length = DMA1_Channel6->CNTR;
-        TCPConnValid = 1;
-        printf("TCP Connect Success\r\n");
+        u16 port = SocketInf[socketid].SourPort;        //the local port tells which listener accepted it
+
+        if((port == RAW_PORT) && !RawConnected)
+        {
+            RawSocket = socketid;
+            WCHNET_SocketSetKeepLive(socketid, ENABLE);
+            WCHNET_ModifyRecvBuf(socketid, (u32)RawRecvBuf, RECE_BUF_LEN);
+            Uart_RxFlush();                             //forget bytes that arrived while nobody was connected
+            KP184_BusLocked = 1;
+            RawConnected = 1;
+            printf("raw client connected\r\n");
+        }
+        else if((port == SCPI_PORT) && !Scpi_IsConnected())
+        {
+            WCHNET_SocketSetKeepLive(socketid, ENABLE);
+            WCHNET_ModifyRecvBuf(socketid, (u32)ScpiRecvBuf, SCPI_RECV_BUF_LEN);
+            Scpi_Connect(socketid);
+            printf("SCPI client connected\r\n");
+        }
+        else
+        {
+            /* A second client on a port that already has one. */
+            WCHNET_SocketClose(socketid, TCP_CLOSE_RST);
+            return;
+        }
     }
-    if(intstat & SINT_STAT_DISCONNECT)                  //disconnect; the listening socket stays open
+    if(intstat & SINT_STAT_RECV)                        //receive data
     {
-        if(socketid == SocketId) TCPConnValid = 0;
-        printf("TCP Disconnect\r\n");
+        if(RawConnected && (socketid == RawSocket))
+        {
+            ETHRx(socketid);
+        }
+        else if(!(Scpi_IsConnected() && (socketid == Scpi_Socket())))
+        {
+            len = WCHNET_SocketRecvLen(socketid, NULL);
+            WCHNET_SocketRecv(socketid, NULL, &len);    //nobody wants it
+        }
+        /* SCPI data stays in the socket buffer until Scpi_Poll() reads it. */
     }
-    if(intstat & SINT_STAT_TIM_OUT)                     //timeout disconnect
+    if(intstat & (SINT_STAT_DISCONNECT | SINT_STAT_TIM_OUT))    //closed or timed out; the listening sockets stay open
     {
-        if(socketid == SocketId) TCPConnValid = 0;
-        printf("TCP Timeout\r\n");
+        if(RawConnected && (socketid == RawSocket))
+        {
+            RawConnected = 0;
+            KP184_BusLocked = 0;
+            printf("raw client gone\r\n");
+        }
+        else if(Scpi_IsConnected() && (socketid == Scpi_Socket()))
+        {
+            Scpi_Disconnect();
+            printf("SCPI client gone\r\n");
+        }
     }
 }
 
@@ -315,12 +330,8 @@ u8 WCHNET_DHCPCallBack(u8 status, void *arg)
     printf("DHCP Success\r\n");
     if(memcmp(IPAddr, p, sizeof(IPAddr)))
     {
-        /* New or changed address: a client connected to the old one is gone. */
-        if(TCPConnValid)
-        {
-            TCPConnValid = 0;
-            WCHNET_SocketClose(SocketId, TCP_CLOSE_NORMAL);
-        }
+        /* New or changed address: clients connected to the old one are gone. */
+        CloseClients();
         memcpy(IPAddr, p, 4);
         memcpy(GWIPAddr, &p[4], 4);
         memcpy(IPMask, &p[8], 4);
@@ -329,7 +340,8 @@ u8 WCHNET_DHCPCallBack(u8 status, void *arg)
     }
     if(!ListenValid)
     {
-        WCHNET_CreateTcpSocketListen();
+        ListenValid = WCHNET_CreateTcpSocketListen(SCPI_PORT) &
+                      WCHNET_CreateTcpSocketListen(RAW_PORT);
     }
     return READY;
 }
@@ -344,11 +356,11 @@ u8 WCHNET_DHCPCallBack(u8 status, void *arg)
 int main(void)
 {
     u8 i;
-    
+
     SystemCoreClockUpdate();
-	Delay_Init();
-	USART_Printf_Init(115200);                                              //USART initialize
-	printf("ETH_UART\r\n");	
+    Delay_Init();
+    USART_Printf_Init(115200);                                              //USART initialize
+    printf("eth485\r\n");
     if((SystemCoreClock == 60000000) || (SystemCoreClock == 120000000))
         printf("SystemClk:%lu\r\n", (unsigned long)SystemCoreClock);
     else
@@ -359,11 +371,13 @@ int main(void)
     }
     WCHNET_GetMacAddr(MACAddr);                                             //get the chip MAC address
     printf("mac addr:");
-    for(i = 0; i < 6; i++) 
+    for(i = 0; i < 6; i++)
         printf("%x ", (unsigned)MACAddr[i]);
     printf("\r\n");
+    Tick_Init();
     TIM2_Init();
     BSP_Uart_Init(BAUD_RATE);                                               //USART2 initialize
+    Scpi_Init();
     WCHNET_DHCPSetHostname(DHCP_HOSTNAME);                                  //Configure DHCP host name
     i = ETH_LibInit(IPAddr,GWIPAddr,IPMask,MACAddr);                        //Ethernet library initialize
     mStopIfError(i);
@@ -375,8 +389,8 @@ int main(void)
         while(1);
     }
 
-    /* There is one TCP slot, so a client that vanished must be noticed quickly
-     * or it blocks the next one: probe after 10 s idle, give up after 3 x 5 s. */
+    /* Each port takes one client, so one that vanished must be noticed quickly
+     * or it blocks the next: probe after 10 s idle, give up after 3 x 5 s. */
     {
         struct _KEEP_CFG cfg;
 
@@ -385,7 +399,7 @@ int main(void)
         cfg.KLCount = 3;
         WCHNET_ConfigKeepLive(&cfg);
     }
-    WCHNET_DHCPStart(WCHNET_DHCPCallBack);                                  //Start DHCP; the callback opens the listening socket
+    WCHNET_DHCPStart(WCHNET_DHCPCallBack);                                  //Start DHCP; the callback opens the listening sockets
 
 	while(1)
 	{
@@ -398,9 +412,10 @@ int main(void)
         {
             WCHNET_HandleGlobalInt();
         }
-        if(TCPConnValid){
-            uartTx();
+        Uart_TxKick();
+        if(RawConnected){
             uartRxAndSendDataToETH();
         }
+        Scpi_Poll();
     }
 }

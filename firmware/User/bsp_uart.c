@@ -10,6 +10,7 @@
 * microcontroller manufactured by Nanjing Qinheng Microelectronics.
 *******************************************************************************/
 #include "bsp_uart.h"
+#include "tick.h"
 
 /* Global Variable */
 
@@ -147,4 +148,125 @@ void BSP_Uart_Init(uint32_t baudrate )
 
     UART_DMA_Init();
     UART_Interrupt_Init();
+}
+
+/**********************************************************************
+ *  @fn      Uart_RxPeek
+ *
+ *  @brief   Look at the bytes received since the last consume. After the
+ *           DMA has wrapped, the part up to the end of the buffer is
+ *           returned first and the rest on the next call.
+ *
+ *  @param   p - set to the first unread byte
+ *
+ *  @return  number of contiguous unread bytes at *p
+ * */
+uint16_t Uart_RxPeek(uint8_t **p)
+{
+    uint16_t cntr = DMA1_Channel6->CNTR;            /* bytes left before the DMA wraps */
+    uint16_t last = uart_data_t.last_RX_DMA_length;
+
+    if(cntr == 0) cntr = UART_RX_DMA_SIZE;
+    if(cntr == last) return 0;
+    *p = &uart_data_t.RX_buffer[UART_RX_DMA_SIZE - last];
+    return (cntr < last) ? (last - cntr) : last;
+}
+
+void Uart_RxConsume(uint16_t n)
+{
+    uart_data_t.last_RX_DMA_length -= n;
+    if(uart_data_t.last_RX_DMA_length == 0)
+        uart_data_t.last_RX_DMA_length = UART_RX_DMA_SIZE;
+}
+
+void Uart_RxFlush(void)
+{
+    uint16_t cntr = DMA1_Channel6->CNTR;
+
+    uart_data_t.last_RX_DMA_length = cntr ? cntr : UART_RX_DMA_SIZE;
+}
+
+/**********************************************************************
+ *  @fn      Uart_BusQuiet
+ *
+ *  @brief   Tell whether the line has been silent long enough to transmit.
+ *           Measured on the KP184 through an HW-0519 module: a request that
+ *           starts within about 1.5 ms of the end of a reply loses its first
+ *           bytes on the bus, so the Modbus 3.5-character gap (0.6 ms at
+ *           57600 baud) is not enough. Call it often; it watches the receive
+ *           DMA counter and so only notices bytes when it is called.
+ *
+ *  @return  1 when nothing has been received for TX_GUARD
+ * */
+#define TX_GUARD    TICK_MS(5)
+
+uint8_t Uart_BusQuiet(void)
+{
+    static uint16_t seen, since;
+    static uint8_t quiet = 1;
+    uint16_t cntr = DMA1_Channel6->CNTR;
+
+    if(cntr != seen)
+    {
+        seen = cntr;
+        since = Tick_Now();
+        quiet = 0;
+    }
+    else if(!quiet && (Tick_Since(since) >= TX_GUARD))
+    {
+        quiet = 1;
+    }
+    return quiet;
+}
+
+/**********************************************************************
+ *  @fn      Uart_TxKick
+ *
+ *  @brief   Send the next buffer queued by the raw TCP port, by DMA, once
+ *           the bus is quiet.
+ * */
+void Uart_TxKick(void)
+{
+    if(!Uart_BusQuiet()) return;
+    if(uart_data_t.uart_tx_dma_state == IDLE)
+    {
+        if(uart_data_t.tx_remainBuffNum < UART_TX_BUF_NUM)
+        {
+            DMA1_Channel7->MADDR = (uint32_t) &uart_data_t.TX_buffer[uart_data_t.tx_read];
+            DMA1_Channel7->CNTR = uart_data_t.TX_data_length[uart_data_t.tx_read];
+            uart_data_t.uart_tx_dma_state = BUSY;
+            DMA_Cmd(DMA1_Channel7,ENABLE);
+        }
+    }
+}
+
+/**********************************************************************
+ *  @fn      Uart_SendBlocking
+ *
+ *  @brief   Send a short frame by polling and return when its last stop
+ *           bit has left, so the caller knows when the line is quiet.
+ *           Anything still queued by the raw TCP port goes out first.
+ * */
+void Uart_SendBlocking(const uint8_t *buf, uint16_t len)
+{
+    uint16_t t0 = Tick_Now();
+
+    /* Three full buffers take 1.5 s at 57600 baud; give up waiting after 3 s. */
+    while((uart_data_t.uart_tx_dma_state != IDLE) || (uart_data_t.tx_remainBuffNum < UART_TX_BUF_NUM))
+    {
+        Uart_TxKick();
+        if(Tick_Since(t0) > TICK_MS(3000)) break;
+    }
+    /* A bus that never falls silent must not hang the gateway: send anyway after 100 ms. */
+    t0 = Tick_Now();
+    while(!Uart_BusQuiet())
+    {
+        if(Tick_Since(t0) > TICK_MS(100)) break;
+    }
+    while(len--)
+    {
+        while(USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);
+        USART_SendData(USART2, *buf++);
+    }
+    while(USART_GetFlagStatus(USART2, USART_FLAG_TC) == RESET);
 }

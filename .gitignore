@@ -17,3 +17,6 @@ Release/
 
 # Fetched SDK checkout (make sdk)
 third_party/
+
+# Python
+__pycache__/

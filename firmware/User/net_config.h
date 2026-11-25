@@ -24,9 +24,9 @@ extern "C" {
 
 #define WCHNET_NUM_UDP                1  /* The number of UDP connections (DHCP needs one) */
 
-#define WCHNET_NUM_TCP                1  /* Number of TCP connections */
+#define WCHNET_NUM_TCP                3  /* Number of TCP connections: SCPI, raw, and one spare so a surplus client is refused cleanly */
 
-#define WCHNET_NUM_TCP_LISTEN         1  /* Number of TCP listening */
+#define WCHNET_NUM_TCP_LISTEN         2  /* Number of TCP listening: the SCPI and raw ports */
 
 /* The number of sockets, the maximum is 31  */
 #define WCHNET_MAX_SOCKET_NUM         (WCHNET_NUM_IPRAW+WCHNET_NUM_UDP+WCHNET_NUM_TCP+WCHNET_NUM_TCP_LISTEN)

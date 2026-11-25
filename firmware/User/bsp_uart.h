@@ -16,7 +16,7 @@
 #include "net_config.h"
 
 /* Global define */
-#define BAUD_RATE  115200
+#define BAUD_RATE  57600    /* the KP184's RS485 rate; 8N1 */
 
 #define UART_RX_DMA_SIZE    RECE_BUF_LEN
 
@@ -44,6 +44,17 @@ struct uart_data
 extern struct uart_data  uart_data_t;
 
 extern void BSP_Uart_Init(uint32_t baudrate );
+
+/* Receive side: the circular DMA buffer, read through one cursor. */
+extern uint16_t Uart_RxPeek(uint8_t **p);       /* contiguous unread bytes at *p, 0 if none */
+extern void Uart_RxConsume(uint16_t n);         /* mark n of the peeked bytes as read */
+extern void Uart_RxFlush(void);                 /* forget everything received so far */
+
+extern uint8_t Uart_BusQuiet(void);             /* 1 once nothing has been received for the guard time */
+
+/* Transmit side. Nothing is sent until the bus has been quiet for the guard time. */
+extern void Uart_TxKick(void);                  /* start the next queued DMA transfer, if any */
+extern void Uart_SendBlocking(const uint8_t *buf, uint16_t len);  /* returns once the last bit has left */
 
 #endif /* end of bsp_uart.h */
 

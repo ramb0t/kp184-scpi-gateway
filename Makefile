@@ -23,6 +23,11 @@ SDK_REV := b375bbbc7dfe8642d6fb7c17e6d3207ee1c3c9c1
 SDK_DIR := third_party/ch32v20x
 SDK_SUBSET := EVT/EXAM/SRC EVT/EXAM/ETH/NetLib EVT/EXAM/ETH/DHCP EVT/EXAM/ETH/ETH_UART
 
+# SCPI parser library, used by the bridge firmware only (v2.3).
+SCPI_URL := https://github.com/j123b567/scpi-parser.git
+SCPI_REV := 361fe25cb1fe4cacb4f7494944c5d4084eb07f61
+SCPI_DIR := third_party/scpi-parser
+
 EXAM := $(SDK_DIR)/EVT/EXAM
 SRC  := $(EXAM)/SRC
 NET  := $(EXAM)/ETH/NetLib
@@ -43,6 +48,10 @@ C_SRCS := $(wildcard $(APP)/User/*.c) \
           $(wildcard $(SRC)/Peripheral/src/*.c) \
           $(SRC)/Core/core_riscv.c $(SRC)/Debug/debug.c $(NET)/eth_driver.c
 S_SRCS := $(SRC)/Startup/startup_ch32v20x_D8W.S
+ifndef EXAMPLE
+C_SRCS += $(wildcard $(SCPI_DIR)/libscpi/src/*.c)
+APP_FLAGS := -I$(SCPI_DIR)/libscpi/inc -DSCPI_USER_CONFIG=1
+endif
 OBJS   := $(addprefix $(OUT)/,$(notdir $(C_SRCS:.c=.o) $(S_SRCS:.S=.o)))
 vpath %.c $(sort $(dir $(C_SRCS)))
 vpath %.S $(sort $(dir $(S_SRCS)))
@@ -50,7 +59,7 @@ vpath %.S $(sort $(dir $(S_SRCS)))
 ARCH    := -march=rv32imac_xw -mabi=ilp32 -msmall-data-limit=8 -msave-restore
 CFLAGS  := $(ARCH) -Os -g -std=gnu99 -fmessage-length=0 -fsigned-char \
            -ffunction-sections -fdata-sections -fno-common -Wunused \
-           -DCH32V20x_D8W -DDEBUG=$(DEBUG_UART) \
+           -DCH32V20x_D8W -DDEBUG=$(DEBUG_UART) $(APP_FLAGS) \
            -I$(APP)/User -I$(SRC)/Core -I$(SRC)/Debug -I$(SRC)/Peripheral/inc -I$(NET)
 LDFLAGS := $(ARCH) -T $(APP)/Ld/Link.ld -nostartfiles -Wl,--gc-sections \
            -Wl,-Map=$(OUT)/$(NAME).map -Wl,--print-memory-usage \
@@ -94,6 +103,8 @@ sdk:
 	test -d $(SDK_DIR)/.git || git clone --filter=blob:none --sparse --no-checkout $(SDK_URL) $(SDK_DIR)
 	git -C $(SDK_DIR) sparse-checkout set $(SDK_SUBSET)
 	git -C $(SDK_DIR) checkout -q $(SDK_REV)
+	test -d $(SCPI_DIR)/.git || git clone --filter=blob:none --no-checkout $(SCPI_URL) $(SCPI_DIR)
+	git -C $(SCPI_DIR) checkout -q $(SCPI_REV)
 
 clean:
 	rm -rf build
