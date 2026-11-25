@@ -39,15 +39,16 @@ typedef struct {
     uint32_t current_ma;
 } kp184_status_t;
 
-/* Set while a raw TCP client owns the RS485 port; every call then returns KP184_ERR_BUSY. */
-extern volatile uint8_t KP184_BusLocked;
-
-/* The raw client has gone. The next transfer first waits until the bytes it
- * queued have been sent and the load's last reply to it has passed. */
+/* A raw TCP client takes the RS485 port: until it is released, every call
+ * below returns KP184_ERR_BUSY. After a release the next call, or the next
+ * claim, first waits until the bytes the client queued have been sent and
+ * the load's last reply to it has passed, up to half a second. */
+void KP184_BusClaim(void);
 void KP184_BusRelease(void);
 
 kp184_err_t KP184_Read(uint16_t reg, uint32_t *value);
 kp184_err_t KP184_Write(uint16_t reg, uint32_t value);
+kp184_err_t KP184_SetInput(uint8_t on);
 kp184_err_t KP184_Status(kp184_status_t *st);
 
 #endif

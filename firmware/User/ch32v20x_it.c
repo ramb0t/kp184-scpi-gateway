@@ -9,86 +9,27 @@
 * Attention: This software (modified or not) and binary are used for 
 * microcontroller manufactured by Nanjing Qinheng Microelectronics.
 *******************************************************************************/
+/* The interrupts that belong to no module of ours. TIM2's handler is in
+ * tick.c and the uart's transmit DMA handler in uart.c. */
 #include "ch32v20x_it.h"
 #include "eth_driver.h"
-#include "bsp_uart.h"
-#include "wdg.h"
 
 void NMI_Handler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 void HardFault_Handler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 void ETH_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-void TIM2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-void DMA1_Channel7_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 
-/*********************************************************************
- * @fn      NMI_Handler
- *
- * @brief   This function handles NMI exception.
- *
- * @return  none
- */
 void NMI_Handler(void)
 {
-    /**/
 }
 
-/*********************************************************************
- * @fn      HardFault_Handler
- *
- * @brief   This function handles Hard Fault exception.
- *
- * @return  none
- */
+/* Restart; the load's input goes off as the gateway starts again. */
 void HardFault_Handler(void)
 {
     NVIC_SystemReset();
-    while (1);
+    while(1);
 }
 
-/*********************************************************************
- * @fn      ETH_IRQHandler
- *
- * @brief   This function handles ETH exception.
- *
- * @return  none
- */
 void ETH_IRQHandler(void)
 {
     WCHNET_ETHIsr();
 }
-
-/*********************************************************************
- * @fn      TIM2_IRQHandler
- *
- * @brief   This function handles TIM2 exception.
- *
- * @return  none
- */
-void TIM2_IRQHandler(void)
-{
-    WCHNET_TimeIsr(WCHNETTIMERPERIOD);
-    Uptime_ms += WCHNETTIMERPERIOD;
-    TIM_ClearITPendingBit(TIM2, TIM_IT_Update);
-}
-
-/*********************************************************************
- * @fn      DMA1_Channel7_IRQHandler
- *
- * @brief   uart2 DMA Tx completion interrupt.
- *
- * @return  none
- */
-void DMA1_Channel7_IRQHandler(void)
-{
-    if(DMA_GetITStatus(DMA1_IT_TC7))
-    {
-        DMA_Cmd(DMA1_Channel7,DISABLE);
-        uart_data_t.uart_tx_dma_state = IDLE;
-        uart_data_t.tx_read++;
-        /* Prevent access from out-of-bounds */
-        uart_data_t.tx_read = (uart_data_t.tx_read)%UART_TX_BUF_NUM;
-        uart_data_t.tx_remainBuffNum++;
-        DMA_ClearITPendingBit(DMA1_IT_TC7);
-    }
-}
-

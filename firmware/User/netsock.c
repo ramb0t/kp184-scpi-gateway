@@ -1,6 +1,7 @@
 #include <string.h>
 #include "netsock.h"
 #include "eth_driver.h"
+#include "tick.h"
 #include "wdg.h"
 
 void Net_Service(void)
@@ -9,12 +10,21 @@ void Net_Service(void)
     Wdg_Feed();
 }
 
-void Net_SessionStart(net_session_t *s, uint8_t id)
+void Net_ServiceFor(uint16_t ticks)
+{
+    uint16_t t0 = Tick_Now();
+
+    while(Tick_Since(t0) < ticks) Net_Service();
+}
+
+void Net_SessionStart(net_session_t *s, uint8_t id, uint8_t *recv_buffer, uint32_t size)
 {
     s->id = id;
     memcpy(s->ip, SocketInf[id].IPAddr, 4);
     s->port = (uint16_t)SocketInf[id].DesPort;
     s->active = 1;
+    WCHNET_SocketSetKeepLive(id, ENABLE);
+    WCHNET_ModifyRecvBuf(id, (uint32_t)recv_buffer, size);
 }
 
 uint8_t Net_SessionOwnsSlot(const net_session_t *s)
@@ -28,6 +38,14 @@ uint8_t Net_SessionOwnsSlot(const net_session_t *s)
 uint8_t Net_SessionOpen(const net_session_t *s)
 {
     return Net_SessionOwnsSlot(s) && (SocketInf[s->id].SockStatus == SOCK_STAT_OPEN);
+}
+
+/* A reset, not a close: it frees the connection at once. After a plain close
+ * the client could go on sending for a while, into a receive buffer that by
+ * then belongs to its successor. */
+void Net_SessionDrop(const net_session_t *s)
+{
+    if(Net_SessionOpen(s)) WCHNET_SocketClose(s->id, TCP_CLOSE_RST);
 }
 
 uint32_t Net_SessionPending(const net_session_t *s)

@@ -1,9 +1,8 @@
 #include <string.h>
 #include "kp184.h"
-#include "bsp_uart.h"
+#include "uart.h"
 #include "tick.h"
 #include "netsock.h"
-#include "eth_driver.h"
 
 /* The load starts answering 5 to 8 ms after a request. */
 #define REPLY_TIMEOUT   TICK_MS(300)
@@ -26,14 +25,19 @@
 /* A transceiver switching direction can leave a stray byte before or after the reply. */
 #define MAX_LEADING     3
 
-volatile uint8_t KP184_BusLocked = 0;
-static uint8_t settle;
+#define FN_READ         0x03
+#define FN_WRITE        0x06
 
-void KP184_BusRelease(void)
-{
-    settle = 1;
-    KP184_BusLocked = 0;
-}
+/* Frame lengths in bytes, CRC included. */
+#define READ_REQUEST    8
+#define WRITE_REQUEST   13
+#define READ_REPLY      9       /* address, function, byte count, 4-byte value, CRC */
+#define WRITE_ACK       8       /* address, function, register, low 16 bits of the value, CRC */
+#define STATUS_REPLY    23      /* the short status block */
+#define CRC_LEN         2
+
+static uint8_t bus_claimed;         /* a raw client owns the bus */
+static uint8_t settle_first;        /* the raw client has just left */
 
 /* Wait until the raw client's queued bytes have gone out and the bus has been
  * silent for SETTLE_QUIET, so its last reply cannot be taken for ours. */
@@ -57,7 +61,19 @@ static void settle_bus(void)
         }
     }
     Uart_RxFlush();
-    settle = 0;
+    settle_first = 0;
+}
+
+void KP184_BusClaim(void)
+{
+    if(settle_first) settle_bus();
+    bus_claimed = 1;
+}
+
+void KP184_BusRelease(void)
+{
+    settle_first = 1;
+    bus_claimed = 0;
 }
 
 static uint16_t crc16(const uint8_t *p, uint16_t n)
@@ -74,16 +90,17 @@ static uint16_t crc16(const uint8_t *p, uint16_t n)
     return crc;
 }
 
-static uint8_t finish(uint8_t *req, uint8_t n)
+/* Append the CRC to the n bytes of a request; returns the frame's length. */
+static uint8_t seal(uint8_t *req, uint8_t n)
 {
     uint16_t crc = crc16(req, n);
 
     req[n] = (uint8_t)crc;              /* low byte first, as standard Modbus */
     req[n + 1] = (uint8_t)(crc >> 8);
-    return n + 2;
+    return n + CRC_LEN;
 }
 
-static uint32_t be(const uint8_t *p, uint8_t n)
+static uint32_t big_endian(const uint8_t *p, uint8_t n)
 {
     uint32_t v = 0;
 
@@ -94,7 +111,7 @@ static uint32_t be(const uint8_t *p, uint8_t n)
 /* One request and its reply of known length. On success frame holds the
  * reply from its address byte to its CRC. The network stack keeps running
  * while we wait. */
-static kp184_err_t xfer_once(const uint8_t *req, uint8_t reqlen, uint8_t *frame, uint8_t replylen)
+static kp184_err_t exchange_once(const uint8_t *req, uint8_t reqlen, uint8_t *frame, uint8_t replylen)
 {
     uint8_t rx[MAX_FRAME + 16];
     uint8_t n = 0, off, start = 0, *p;
@@ -102,7 +119,7 @@ static kp184_err_t xfer_once(const uint8_t *req, uint8_t reqlen, uint8_t *frame,
 
     Uart_SendBlocking(req, reqlen);
     t0 = Tick_Now();
-    while(Tick_Since(t0) < ECHO_GUARD);
+    while(Tick_Since(t0) < ECHO_GUARD);         /* 0.4 ms: too short to run the network in */
     Uart_RxFlush();
 
     t0 = Tick_Now();
@@ -141,7 +158,7 @@ static kp184_err_t xfer_once(const uint8_t *req, uint8_t reqlen, uint8_t *frame,
     for(off = start; (off <= start + MAX_LEADING) && (off + replylen <= n); off++)
     {
         if((rx[off] == req[0]) && (rx[off + 1] == req[1]) &&
-           (crc16(rx + off, replylen - 2) == (rx[off + replylen - 2] | ((uint16_t)rx[off + replylen - 1] << 8))))
+           (crc16(rx + off, replylen - CRC_LEN) == (rx[off + replylen - 2] | ((uint16_t)rx[off + replylen - 1] << 8))))
         {
             memcpy(frame, rx + off, replylen);
             return KP184_OK;
@@ -150,63 +167,66 @@ static kp184_err_t xfer_once(const uint8_t *req, uint8_t reqlen, uint8_t *frame,
     return KP184_ERR_FRAME;
 }
 
-static kp184_err_t xfer(const uint8_t *req, uint8_t reqlen, uint8_t *frame, uint8_t replylen)
+static kp184_err_t exchange(const uint8_t *req, uint8_t reqlen, uint8_t *frame, uint8_t replylen)
 {
     kp184_err_t r;
-    uint16_t t0;
 
-    if(KP184_BusLocked) return KP184_ERR_BUSY;
-    if(settle) settle_bus();
-    r = xfer_once(req, reqlen, frame, replylen);
+    if(bus_claimed) return KP184_ERR_BUSY;
+    if(settle_first) settle_bus();
+    r = exchange_once(req, reqlen, frame, replylen);
     if(r != KP184_OK)
     {
         /* Every request only reads or sets a value, so repeating one is harmless. */
-        t0 = Tick_Now();
-        while(Tick_Since(t0) < RETRY_PAUSE) Net_Service();
-        r = xfer_once(req, reqlen, frame, replylen);
+        Net_ServiceFor(RETRY_PAUSE);
+        r = exchange_once(req, reqlen, frame, replylen);
     }
     return r;
 }
 
 kp184_err_t KP184_Read(uint16_t reg, uint32_t *value)
 {
-    uint8_t req[8] = {KP184_ADDR, 0x03, reg >> 8, reg & 0xFF, 0x00, 0x04};
+    uint8_t req[READ_REQUEST] = {KP184_ADDR, FN_READ, reg >> 8, reg & 0xFF, 0x00, 0x04};
     uint8_t frame[MAX_FRAME];
-    kp184_err_t r = xfer(req, finish(req, 6), frame, 9);
+    kp184_err_t r = exchange(req, seal(req, READ_REQUEST - CRC_LEN), frame, READ_REPLY);
 
     if(r != KP184_OK) return r;
     if(frame[2] != 4) return KP184_ERR_FRAME;
-    *value = be(frame + 3, 4);
+    *value = big_endian(frame + 3, 4);
     if((reg == KP184_REG_OUTPUT) || (reg == KP184_REG_MODE)) *value &= 0xFFFF;
     return KP184_OK;
 }
 
 kp184_err_t KP184_Write(uint16_t reg, uint32_t value)
 {
-    uint8_t req[13] = {KP184_ADDR, 0x06, reg >> 8, reg & 0xFF, 0x00, 0x01, 0x04,
-                       value >> 24, value >> 16, value >> 8, value};
+    uint8_t req[WRITE_REQUEST] = {KP184_ADDR, FN_WRITE, reg >> 8, reg & 0xFF, 0x00, 0x01, 0x04,
+                                  value >> 24, value >> 16, value >> 8, value};
     uint8_t frame[MAX_FRAME];
     /* Firmware 2128 acknowledges with address, function, register and the low
      * 16 bits of the value. The manual describes an echo of the whole request
      * instead; that form is not accepted, because it cannot be told apart
      * from an RS485 module echoing the request to a load that stays silent. */
-    kp184_err_t r = xfer(req, finish(req, 11), frame, 8);
+    kp184_err_t r = exchange(req, seal(req, WRITE_REQUEST - CRC_LEN), frame, WRITE_ACK);
 
     if(r != KP184_OK) return r;
-    if((be(frame + 2, 2) == reg) && (be(frame + 4, 2) == (value & 0xFFFF)))
+    if((big_endian(frame + 2, 2) == reg) && (big_endian(frame + 4, 2) == (value & 0xFFFF)))
         return KP184_OK;
     return KP184_ERR_FRAME;
 }
 
+kp184_err_t KP184_SetInput(uint8_t on)
+{
+    return KP184_Write(KP184_REG_OUTPUT, on);
+}
+
 kp184_err_t KP184_Status(kp184_status_t *st)
 {
-    uint8_t req[8] = {KP184_ADDR, 0x03, KP184_REG_STATUS >> 8, KP184_REG_STATUS & 0xFF, 0x00, 0x00};
+    uint8_t req[READ_REQUEST] = {KP184_ADDR, FN_READ, KP184_REG_STATUS >> 8, KP184_REG_STATUS & 0xFF, 0x00, 0x00};
     uint8_t frame[MAX_FRAME];
-    kp184_err_t r = xfer(req, finish(req, 6), frame, 23);   /* the short status block */
+    kp184_err_t r = exchange(req, seal(req, READ_REQUEST - CRC_LEN), frame, STATUS_REPLY);
 
     if(r != KP184_OK) return r;
     st->output_on = frame[3] & 1;
-    st->voltage_mv = be(frame + 5, 3);
-    st->current_ma = be(frame + 8, 3);
+    st->voltage_mv = big_endian(frame + 5, 3);
+    st->current_ma = big_endian(frame + 8, 3);
     return KP184_OK;
 }

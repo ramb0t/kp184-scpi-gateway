@@ -22,15 +22,18 @@ typedef struct {
     uint16_t port;
 } net_session_t;
 
-void     Net_SessionStart(net_session_t *s, uint8_t id);
+/* Adopt the client just accepted on socket id; what it sends collects in recv_buffer. */
+void     Net_SessionStart(net_session_t *s, uint8_t id, uint8_t *recv_buffer, uint32_t size);
 uint8_t  Net_SessionOwnsSlot(const net_session_t *s);  /* the slot still holds this client, open or closed */
 uint8_t  Net_SessionOpen(const net_session_t *s);      /* ... and the connection is still open */
 uint32_t Net_SessionPending(const net_session_t *s);   /* unread bytes */
 uint32_t Net_SessionRead(net_session_t *s, uint8_t *dst, uint32_t max);
+void     Net_SessionDrop(const net_session_t *s);      /* reset the connection, if it is still open */
 
 /* Run the network stack and feed the watchdog. Every wait that can last more
  * than a few milliseconds calls this, so the stack keeps running during a
  * transfer and only a real hang trips the watchdog. */
 void     Net_Service(void);
+void     Net_ServiceFor(uint16_t ticks);                /* ... for a while: a pause that keeps the network alive */
 
 #endif
