@@ -1,4 +1,4 @@
-# Builds the eth485 bridge firmware in firmware/, or one of WCH's unmodified CH32V208 Ethernet
+# Builds the eth485 gateway firmware in firmware/, or one of WCH's unmodified CH32V208 Ethernet
 # examples, against a pinned SDK checkout.
 # Flags mirror the examples' MounRiver project (.cproject): rv32imac + WCH xw, ilp32, -Os, newlib-nano.
 #
@@ -11,7 +11,7 @@
 TOOLCHAIN ?= $(HOME)/toolchains/wch-riscv-gcc12/bin/riscv-wch-elf-
 WLINK     ?= wlink
 # UART that printf goes to: 1 = PA9, 2 = PA2, 3 = PB10. The board's TXD/RXD header is USART2
-# (PA2/PA3). The bridge and ETH_UART carry data on it, so their printf stays on PA9, which is
+# (PA2/PA3). The gateway and ETH_UART carry data on it, so their printf stays on PA9, which is
 # not on a header; only the DHCP example prints where it can be seen.
 ifeq ($(EXAMPLE),DHCP)
 DEBUG_UART ?= 2
@@ -24,7 +24,7 @@ SDK_REV := b375bbbc7dfe8642d6fb7c17e6d3207ee1c3c9c1
 SDK_DIR := third_party/ch32v20x
 SDK_SUBSET := EVT/EXAM/SRC EVT/EXAM/ETH/NetLib EVT/EXAM/ETH/DHCP EVT/EXAM/ETH/ETH_UART
 
-# SCPI parser library, used by the bridge firmware only (v2.3).
+# SCPI parser library, used by the gateway firmware only (v2.3).
 SCPI_URL := https://github.com/j123b567/scpi-parser.git
 SCPI_REV := 361fe25cb1fe4cacb4f7494944c5d4084eb07f61
 SCPI_DIR := third_party/scpi-parser
@@ -87,28 +87,35 @@ $(OUT)/%.o: %.c $(OUT)/.cflags
 $(OUT)/%.o: %.S $(OUT)/.cflags
 	$(CC) $(CFLAGS) -x assembler-with-cpp -MMD -MP -c $< -o $@
 
-# Rewritten only when the flags change, so a new DEBUG_UART rebuilds the objects.
+# Rewritten only when the compiler or its flags change, so a new DEBUG_UART rebuilds the objects.
 $(OUT)/.cflags: FORCE | $(OUT)
-	@echo '$(CFLAGS)' | cmp -s - $@ || echo '$(CFLAGS)' > $@
+	@echo '$(CC) $(CFLAGS)' | cmp -s - $@ || echo '$(CC) $(CFLAGS)' > $@
 
 $(OUT):
 	mkdir -p $@
 
 # Link.ld places flash at 0, the alias of 0x08000000, so the address is given explicitly.
-# Reset and halt first: the watchdog is off after a reset and the firmware
-# never gets to start it, so it cannot bite while the flash is written.
+# This order is the one that has worked every time; why is only partly known. The
+# firmware's watchdog cannot be stopped and resets a chip left halted for about 4 s,
+# and a standalone "wlink reset" has been seen to halt and resume without resetting.
+# wlink flash restarts the chip itself, so the new firmware is already running during
+# the readback, which takes about 2 s. Do not add --no-run: that leaves the restart to
+# the watchdog. The readback compare is what catches a bad write.
 flash: $(OUT)/$(NAME).bin
 	$(WLINK) reset halt
 	$(WLINK) flash --address 0x08000000 $<
-	$(WLINK) dump 0x08000000 $$(stat -c %s $<) --out $(OUT)/readback.bin
-	cmp -n $$(stat -c %s $<) $< $(OUT)/readback.bin && echo "readback matches"
+	$(WLINK) dump 0x08000000 $$(wc -c < $<) --out $(OUT)/readback.bin
+	cmp -n $$(wc -c < $<) $< $(OUT)/readback.bin && echo "readback matches"
 	$(WLINK) reset run
 
+# Fetches again only when a pinned revision is not in the clone yet.
 sdk:
 	test -d $(SDK_DIR)/.git || git clone --filter=blob:none --sparse --no-checkout $(SDK_URL) $(SDK_DIR)
+	git -C $(SDK_DIR) cat-file -e $(SDK_REV)^{commit} 2>/dev/null || git -C $(SDK_DIR) fetch -q origin
 	git -C $(SDK_DIR) sparse-checkout set $(SDK_SUBSET)
 	git -C $(SDK_DIR) checkout -q $(SDK_REV)
 	test -d $(SCPI_DIR)/.git || git clone --filter=blob:none --no-checkout $(SCPI_URL) $(SCPI_DIR)
+	git -C $(SCPI_DIR) cat-file -e $(SCPI_REV)^{commit} 2>/dev/null || git -C $(SCPI_DIR) fetch -q origin
 	git -C $(SCPI_DIR) checkout -q $(SCPI_REV)
 
 clean:
