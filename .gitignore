@@ -14,3 +14,6 @@ Release/
 *.swp
 *~
 .DS_Store
+
+# Fetched SDK checkout (make sdk)
+third_party/
