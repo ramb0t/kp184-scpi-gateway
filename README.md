@@ -3,11 +3,13 @@
 Network gateway that puts a Kunkin KP184 electronic load on the LAN, built on a WCH CH32V208 Ethernet board wired to the load's RS485 port.
 It answers SCPI on TCP port 5025, so the load can be driven like any LAN bench instrument, and also passes raw bytes on port 4001 for software that speaks the load's own protocol.
 
+Beta: tested on one board and one load (firmware 2128). It switches real power, so use it at your own risk.
+
 ## Using it
 
-The board takes its address by DHCP under the hostname `eth485`. Each port takes one client at a time: a second SCPI client is refused, while a new raw client takes over and the old one is reset.
+The board takes its address by DHCP under the hostname `eth485`. Each port takes one client at a time: a second SCPI client is refused, while a new raw client takes over and the old one is reset. Neither port asks for a password: anyone who can reach the board on the network can switch the load on.
 
-The load's input goes off whenever the gateway starts, including after a watchdog reset (the watchdog restarts a hung gateway within about 4 s), and when an SCPI client that switched the input on goes away without switching it off: closed, timed out, or network gone, which keepalive notices after about 25 s. A client that wants the load to keep running after it disconnects sends `SYST:FAIL OFF` first; the setting lasts for that connection only. Clients that never switched the input on leave it alone. Complete command lines a client sent before closing are still run, so `INP OFF` followed by an immediate close works.
+The load's input goes off whenever the gateway starts, including after a watchdog reset (the watchdog restarts a hung gateway after about 4 s, or anywhere from 2.7 to 6.4 s across the tolerance of the chip's oscillator), and when an SCPI client that switched the input on goes away without switching it off: closed, timed out, or network gone, which keepalive notices after about 25 s. A client that wants the load to keep running after it disconnects sends `SYST:FAIL OFF` first; the setting lasts for that connection only. Clients that never switched the input on leave it alone. Complete command lines a client sent before closing are still run, so `INP OFF` followed by an immediate close works.
 
 The fail-safe has three limits. Raw-port clients are not covered, and while one holds the RS485 port a pending switch-off waits for it to leave. A load that does not answer gets three tries, about 2 s, and then the gateway gives up. And it acts through the gateway, so it does nothing while the gateway is being flashed.
 
@@ -65,8 +67,12 @@ Against the real load, with a DC supply of 5 to 30 V on its input: `tools/load_t
 
 Without the load: `tools/kp184_sim.py` answers the load's protocol on a serial port and reproduces replies captured from a real KP184 (`--selftest`). With a USB serial adapter wired to the board's TXD/RXD header in place of the RS485 module, `tools/gateway_test.py HOST SERIAL_PORT` runs the simulator and checks both ports end to end. It switches the input on at several amps, so it refuses to run unless a read of the RS485 side times out before the simulator starts and returns the simulator's own voltage afterwards. It has not been run since the fail-safe was added and covers none of it, and the simulator still accepts CV.
 
-The firmware as of commit `325515b` passed `load_test.py` and `race_test.py` on the real load, along with a watchdog restart with the input on. Three paths have only been reviewed, not run: an address change from DHCP while a client is connected, a client whose network disappears without closing, and a load that stops answering during the fail-safe.
+The firmware tagged `v0.2.0-beta` passed `load_test.py` and `race_test.py` on the real load, along with a watchdog restart with the input on. Four paths have only been reviewed, not run: an address change from DHCP while a client is connected, a client whose network disappears without closing, an `INP ON` whose acknowledgement is lost, and a load that stops answering during the fail-safe.
 
 ## Layout
 
 `firmware/User/` holds the sources: `main.c` (start-up, network, which client goes to which port), `scpi_server.c` (the SCPI session and its commands), `raw_port.c` (the raw session), `kp184.c` (the load's protocol), `failsafe.c` (input off when nobody is watching), `netsock.c` (client sessions that survive the connection ending mid-command), `uart.c` (USART2), `tick.c` (time) and `wdg.c` (watchdog); the remaining files are WCH's. The test scripts in `tools/` share `gateway.py`. It started as WCH's ETH_UART example; the tags `dhcp-demo-working`, `eth-uart-bridge-working`, `scpi-gateway-reads-working`, `scpi-gateway-verified` and `gateway-failsafe-watchdog` mark earlier stages.
+
+## Licence
+
+MIT, see `LICENSE`. Files with a WCH header keep WCH's terms.
