@@ -146,7 +146,7 @@ def on_and_measure(ld, label, want_a, want_mode, setpoint):
     v = ld.number("MEAS:VOLT?")
     p = ld.number("MEAS:POW?")
     res = ld.number("MEAS:RES?")
-    check(f"{label}: MEAS:CURR? {i} A, want {want_a} A", near(i, want_a, 0.02 + 0.03 * want_a))
+    check(f"{label}: MEAS:CURR? {i} A, want {want_a:.3f} A", near(i, want_a, 0.02 + 0.03 * want_a))
     check(f"{label}: MEAS:POW? {p} W = V x I", p is not None and v is not None and i is not None
           and near(p, v * i, 0.01), f"V {v} I {i}")
     check(f"{label}: MEAS:RES? {res} ohm = V / I", res is not None and v is not None and i

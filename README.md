@@ -65,7 +65,7 @@ Against the real load, with a DC supply of 5 to 30 V on its input: `tools/load_t
 
 Without the load: `tools/kp184_sim.py` answers the load's protocol on a serial port and reproduces replies captured from a real KP184 (`--selftest`). With a USB serial adapter wired to the board's TXD/RXD header in place of the RS485 module, `tools/gateway_test.py HOST SERIAL_PORT` runs the simulator and checks both ports end to end. It switches the input on at several amps, so it refuses to run unless a read of the RS485 side times out before the simulator starts and returns the simulator's own voltage afterwards. It has not been run since the fail-safe was added and covers none of it, and the simulator still accepts CV.
 
-The last version that passed `load_test.py` and `race_test.py` on the real load is the tag `gateway-failsafe-watchdog`. The firmware since then was restructured and had fail-safe gaps closed; it has been reviewed but not yet run through those tests.
+The firmware as of commit `325515b` passed `load_test.py` and `race_test.py` on the real load, along with a watchdog restart with the input on. Three paths have only been reviewed, not run: an address change from DHCP while a client is connected, a client whose network disappears without closing, and a load that stops answering during the fail-safe.
 
 ## Layout
 
